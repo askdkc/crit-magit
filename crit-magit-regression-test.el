@@ -1,0 +1,260 @@
+;;; crit-magit-regression-test.el --- Workflow regressions -*- lexical-binding: t; -*-
+(require 'crit-magit-test)
+
+(defconst crit-magit-test--fake-dsh
+  (expand-file-name "tests/fake-dsh.py"
+                    (file-name-directory (or load-file-name buffer-file-name))))
+
+(defmacro crit-magit-test--with-repo (&rest body)
+  (declare (indent 0))
+  `(let* ((repo (make-temp-file "crit-magit-workflow-" t))
+          (default-directory (file-name-as-directory repo)))
+     (unwind-protect
+         (progn
+           (crit-magit--git-output repo "init" "-q")
+           (crit-magit--git-output repo "config" "user.email" "test@example.invalid")
+           (crit-magit--git-output repo "config" "user.name" "Test")
+           ,@body)
+       (dolist (buffer (buffer-list))
+         (when (and (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (and (or (derived-mode-p 'magit-mode) buffer-file-name)
+                           (string-prefix-p (file-name-as-directory repo) default-directory))))
+           (kill-buffer buffer)))
+       (delete-directory repo t))))
+
+(defun crit-magit-test--wait (predicate)
+  "Wait up to five seconds for PREDICATE."
+  (let ((deadline (+ (float-time) 5)))
+    (while (and (not (funcall predicate)) (< (float-time) deadline))
+      (accept-process-output nil .02))
+    (should (funcall predicate))))
+
+(ert-deftest crit-magit-regression-midline-and-no-newline ()
+  (crit-magit-test-with-diff-buffer
+      "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new text\n"
+    (forward-line 1)
+    (let ((start (point)))
+      (forward-line 2)
+      (forward-char 4)
+      (should (equal (crit-magit--hunk-line-info start 1 1) '(added . 1))))))
+
+(ert-deftest crit-magit-regression-region-direction ()
+  (crit-magit-test--with-repo
+    (crit-magit-test-with-diff-buffer
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1,2 @@\n+first\n+second\n"
+      (search-forward "+first")
+      (let ((beg (- (point) 3)))
+        (search-forward "second")
+        (let ((end (point)))
+          (crit-magit-test-set-region beg end)
+          (let ((forward (crit-magit--extract-diff-target)))
+            (crit-magit-test-set-region end beg)
+            (should (equal forward (crit-magit--extract-diff-target)))
+            (should (= (plist-get forward :start-line) 1))
+            (should (= (plist-get forward :end-line) 2))))))))
+
+(ert-deftest crit-magit-regression-mixed-region-rejected ()
+  (crit-magit-test-with-diff-buffer "-old\n+new\n"
+    (should-error (crit-magit--region-line-range 1 1 1 'removed 1 (point-max))
+                  :type 'user-error)))
+
+(ert-deftest crit-magit-regression-git-layers-and-unborn ()
+  (crit-magit-test--with-repo
+    (with-temp-file "a" (insert "initial\n"))
+    (crit-magit--git-output repo "add" "a")
+    (should (string-match-p "+initial" (crit-magit--working-tree-diff repo)))
+    (crit-magit--git-output repo "commit" "-qm" "initial")
+    (with-temp-file "a" (insert "staged\n"))
+    (crit-magit--git-output repo "add" "a")
+    (with-temp-file "a" (insert "initial\n"))
+    (let ((diff (crit-magit--working-tree-diff repo)))
+      (should (string-match-p "+staged" diff))
+      (should (string-match-p "-staged" diff)))))
+
+(ert-deftest crit-magit-regression-git-failure ()
+  (let ((repo (make-temp-file "crit-magit-nogit-" t)))
+    (unwind-protect
+        (should-error (crit-magit--working-tree-diff repo) :type 'user-error)
+      (delete-directory repo t))))
+
+(ert-deftest crit-magit-regression-full-request-process ()
+  (crit-magit-test--with-repo
+    (let ((crit-magit-dsh-command crit-magit-test--fake-dsh)
+          (crit-magit--dsh-process nil)
+          (crit-magit-dsh-inline-size-limit 20)
+          (crit-magit-dsh-model-history-file (expand-file-name "history.json" repo))
+          (crit-magit-dsh-selected-model nil)
+          (crit-magit--dsh-model-loaded t)
+          (prompt (concat "日本語のコメント\n" (make-string 180000 ?x) "\nFINAL DIFF LINE"))
+          (result nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt choices &rest _) (caar choices)))
+                    ((symbol-function 'crit-magit--show-review)
+                     (lambda (outcome) (setq result outcome))))
+            (crit-magit--request-review prompt repo)
+            (crit-magit-test--wait (lambda () result))
+            (should (eq (car result) 'success))
+            (let ((data (json-parse-string (cdr result) :object-type 'alist)))
+              (should (equal (alist-get 'prompt data) prompt))
+              (should (equal (file-truename (alist-get 'cwd data)) (file-truename repo)))
+              (should (string-match-p "model: 'test-model'" (alist-get 'patch data)))
+              (should-not (file-exists-p (alist-get 'request_path data)))
+              (should-not (file-exists-p (alist-get 'patch_path data))))
+            (should-not (crit-magit--dsh-running-p)))
+        (when (crit-magit--dsh-running-p) (delete-process crit-magit--dsh-process))))))
+
+(ert-deftest crit-magit-regression-acp-timeout-and-optional-close ()
+  (dolist (scenario '("hang" "no-close"))
+    (let ((crit-magit-dsh-command crit-magit-test--fake-dsh)
+          (crit-magit--dsh-process nil)
+          (crit-magit-dsh-discovery-timeout (if (equal scenario "hang") .2 3))
+          (process-environment (cons (concat "CRIT_MAGIT_TEST_SCENARIO=" scenario)
+                                     process-environment))
+          (result nil) (count 0) process)
+      (unwind-protect
+          (progn
+            (setq process (crit-magit--start-acp-model-discovery
+                           default-directory
+                           (lambda (outcome) (setq result outcome count (1+ count)))))
+            (crit-magit-test--wait (lambda () result))
+            (should (eq (car result) (if (equal scenario "hang") 'error 'success)))
+            (should (= count 1))
+            (should-not (process-live-p process))
+            (should-not (crit-magit--dsh-running-p)))
+        (when (and process (process-live-p process)) (delete-process process))))))
+
+(ert-deftest crit-magit-regression-real-magit-workflow ()
+  :tags '(integration)
+  (skip-unless (require 'magit nil t))
+  (crit-magit-test--with-repo
+    (with-temp-file "a.txt" (insert "old\n"))
+    (crit-magit--git-output repo "add" "a.txt")
+    (crit-magit--git-output repo "commit" "-qm" "initial")
+    (with-temp-file "a.txt" (insert "new 日本語\nlast line\n"))
+    (let ((crit-magit-session-id "workflow")
+          (crit-magit-review-after-comment nil)
+          (captured nil))
+      (with-current-buffer (magit-diff-setup-buffer nil nil nil nil)
+        (goto-char (point-min))
+        (search-forward "+new")
+        (should (crit-magit--section 'hunk))
+        (let ((target (crit-magit--extract-diff-target)))
+          (should (equal (plist-get target :path) "a.txt"))
+          (should (= (plist-get target :start-line) 1))
+          (crit-magit--write-comment target "日本語 comment body"))
+        (cl-letf (((symbol-function 'crit-magit--request-review)
+                   (lambda (prompt _root) (setq captured prompt))))
+          (crit-magit-review)
+          (should (string-match-p "+last line" captured))
+          (goto-char (oref (crit-magit--section 'file) start))
+          (crit-magit-review)
+          (should (string-match-p "Location: whole file" captured))
+          (narrow-to-region (point) (line-end-position))
+          (crit-magit-review-whole)
+          (should (string-match-p "日本語 comment body" captured))
+          (should (string-match-p "+last line" captured))
+          (widen)
+          (crit-magit-review-session)
+          (should (string-match-p "日本語 comment body" captured))
+          (should (string-match-p "+last line" captured))))
+      (with-current-buffer (magit-status-setup-buffer repo)
+        (goto-char (point-min))
+        (search-forward "+new")
+        (should (= (plist-get (crit-magit--extract-diff-target) :start-line) 1))))))
+
+(ert-deftest crit-magit-regression-request-failure-cleanup ()
+  (dolist (scenario '("review-error" "review-hang" "hang" "selection-quit" "startup-error"))
+    (crit-magit-test--with-repo
+      (let* ((crit-magit-dsh-command crit-magit-test--fake-dsh)
+             (crit-magit--dsh-process nil)
+             (crit-magit-dsh-discovery-timeout (if (equal scenario "hang") .15 3))
+             (crit-magit-dsh-inline-size-limit 10)
+             (process-environment (cons (concat "CRIT_MAGIT_TEST_SCENARIO=" scenario)
+                                        process-environment))
+             (make-temp (symbol-function 'make-temp-file))
+             (start-process (symbol-function 'make-process))
+             (created nil) (result nil) (count 0))
+        (unwind-protect
+            (cl-letf (((symbol-function 'make-temp-file)
+                       (lambda (prefix &rest args)
+                         (let ((file (apply make-temp prefix args)))
+                           (when (member prefix '("crit-magit-request-" "crit-magit-dsh-"))
+                             (push file created))
+                           file)))
+                      ((symbol-function 'make-process)
+                       (lambda (&rest args)
+                         (if (and (equal scenario "startup-error")
+                                  (equal (plist-get args :name) "crit-magit-dsh"))
+                             (signal 'file-error '("fixture startup failure"))
+                           (apply start-process args))))
+                      ((symbol-function 'crit-magit--dsh-choose-model)
+                       (lambda (_options)
+                         (if (equal scenario "selection-quit")
+                             (signal 'quit nil)
+                           '("fixture" . "model"))))
+                      ((symbol-function 'crit-magit--show-review)
+                       (lambda (outcome) (setq result outcome count (1+ count)))))
+              (crit-magit--request-review (make-string 1000 ?x) repo)
+              (when (equal scenario "review-hang")
+                (crit-magit-test--wait (lambda () (eq crit-magit--dsh-stage 'review)))
+                (crit-magit-cancel-review))
+              (crit-magit-test--wait
+               (lambda () (and created (cl-every (lambda (file) (not (file-exists-p file))) created))))
+              (should-not (crit-magit--dsh-running-p))
+              (unless (equal scenario "selection-quit")
+                (should (eq (car result) 'error))
+                (should (= count 1))))
+          (when (crit-magit--dsh-running-p) (delete-process crit-magit--dsh-process)))))))
+
+(ert-deftest crit-magit-regression-session-writer-lock-and-path ()
+  (crit-magit-test--with-repo
+    (let* ((crit-magit-session-id "locked")
+           (target (list :repository repo :path "a" :side 'file))
+           (file (crit-magit--session-file repo "locked"))
+           (lock (concat file ".lock")))
+      (make-directory (file-name-directory file) t)
+      (make-directory lock)
+      (should-error (crit-magit--write-comment target "blocked") :type 'user-error)
+      (should-not (file-exists-p file))
+      (should (file-directory-p lock))
+      (delete-directory lock)
+      (crit-magit--write-comment target "saved")
+      (should-not (file-exists-p lock))
+      (let ((crit-magit-session-file-function
+             (lambda (_root _id) (expand-file-name "outside.md" repo))))
+        (should-error (crit-magit--write-comment target "outside") :type 'user-error)))))
+
+(ert-deftest crit-magit-regression-gitignore-crlf ()
+  (crit-magit-test--with-repo
+    (let ((coding-system-for-write 'utf-8-dos))
+      (with-temp-file ".gitignore" (insert "# preserve\nexisting/\n")))
+    (crit-magit--ensure-gitignore repo)
+    (crit-magit--ensure-gitignore repo)
+    (with-temp-buffer
+      (insert-file-contents-literally ".gitignore")
+      (should (equal (buffer-string) "# preserve\r\nexisting/\r\n.critmagit/\r\n")))))
+
+(ert-deftest crit-magit-regression-comment-while-busy-is-saved ()
+  (crit-magit-test--with-repo
+    (let ((crit-magit-session-id "busy")
+          (crit-magit-review-after-comment t))
+      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "save while busy"))
+                ((symbol-function 'crit-magit--dsh-running-p) (lambda () t))
+                ((symbol-function 'crit-magit--review-session-file)
+                 (lambda (&rest _) (ert-fail "Must not dispatch while busy"))))
+        (crit-magit--comment-target (list :repository repo :path "a" :side 'file)))
+      (should (string-match-p "save while busy"
+                              (crit-magit--read-file (crit-magit--session-file repo "busy")))))))
+
+(ert-deftest crit-magit-regression-empty-response-is-error ()
+  (should (eq (car (crit-magit--dsh-outcome 0 " \n" "diagnostic")) 'error)))
+
+(ert-deftest crit-magit-regression-deleted-file-fallback ()
+  (crit-magit-test-with-diff-buffer
+      "diff --git a/old b/old\n--- a/old\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed\n"
+    (search-forward "removed")
+    (should (equal (crit-magit--file-at-point) "old"))))
+
+(provide 'crit-magit-regression-test)

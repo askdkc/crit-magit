@@ -50,6 +50,8 @@
 ;;; Code:
 
 (require 'json)
+(require 'subr-x)
+(require 'eieio)
 
 (defgroup crit-magit nil
   "Local AI review comments from Magit diff buffers."
@@ -122,9 +124,8 @@ Each entry is (LABEL . (PROVIDER . MODEL))."
 
 (defcustom crit-magit-dsh-default-model "DeepSeek-V4-Flash"
   "Label (key of `crit-magit-dsh-models') of the default model.
-When the selected model resolves to the same PROVIDER/MODEL as this
-entry, no `--patch' override is generated and the DSH default model
-is used."
+This label is a fallback for model selection only.  Every request explicitly
+passes its chosen provider and model to the headless profile."
   :type 'string
   :group 'crit-magit)
 
@@ -144,9 +145,9 @@ When nil, `crit-magit' loads the last selection from
   :group 'crit-magit)
 
 (defcustom crit-magit-dsh-inline-size-limit 16000
-  "Maximum characters of diff content to inline into a review prompt.
-When the content to review exceeds this many characters, the prompt
-instructs the DSH agent to run `git diff' instead of inlining."
+  "Maximum UTF-8 bytes of a review prompt passed on the command line.
+Larger requests are saved intact in a private temporary file for DSH to read.
+The file is removed after completion, failure, or cancellation."
   :type 'integer
   :group 'crit-magit)
 
@@ -187,9 +188,22 @@ sent later with `crit-magit-review-session'."
 (declare-function magit-toplevel "magit" (&optional directory))
 (declare-function magit-file-at-point "magit" (&optional noprompt))
 (declare-function magit-current-section "magit-section" ())
-(declare-function magit-section-type "magit-section" (section))
-(declare-function magit-section-value "magit-section" (section))
-(declare-function magit-section-parent "magit-section" (section))
+(defcustom crit-magit-dsh-discovery-timeout 30
+  "Maximum seconds to wait for ACP model discovery."
+  :type 'number
+  :group 'crit-magit)
+
+(defun crit-magit--section-slot (section slot)
+  "Read SLOT from a Magit SECTION without requiring Magit at compile time."
+  (eieio-oref section slot))
+
+(defun crit-magit--section (type)
+  "Return the ancestor Magit section of TYPE at point, or nil."
+  (let ((section (and (fboundp 'magit-current-section)
+                      (magit-current-section))))
+    (while (and section (not (eq (crit-magit--section-slot section 'type) type)))
+      (setq section (crit-magit--section-slot section 'parent)))
+    section))
 
 ;;;; DSH status
 
@@ -228,9 +242,9 @@ STAGE identifies the visible operation status."
 ;;;; Position extraction
 
 (defun crit-magit--assert-diff-buffer ()
-  "Signal an error unless the current buffer is a Magit diff buffer."
-  (unless (derived-mode-p 'magit-diff-mode)
-    (user-error "Not in a Magit diff buffer")))
+  "Signal an error unless the current buffer can contain Magit diffs."
+  (unless (derived-mode-p 'magit-diff-mode 'magit-status-mode)
+    (user-error "Not in a Magit diff or status buffer")))
 
 (defun crit-magit--assert-review-buffer ()
   "Signal an error unless the current buffer is a Magit diff or status buffer.
@@ -240,16 +254,36 @@ Return non-nil on success."
     (user-error "Not in a Magit diff or status buffer"))
   t)
 
+(defun crit-magit--git-output (root &rest args)
+  "Run Git ARGS in ROOT, returning output or signaling an error."
+  (let ((default-directory (file-name-as-directory (expand-file-name root))))
+    (with-temp-buffer
+      (let ((status (apply #'call-process "git" nil t nil args)))
+        (unless (equal status 0)
+          (user-error "Git %s failed (%s): %s"
+                      (car args) status (string-trim (buffer-string))))
+        (buffer-string)))))
+
 (defun crit-magit--working-tree-diff (root)
-  "Return the staged and unstaged diff of ROOT as a string.
-Uses `git diff HEAD'.  Return an empty string when git fails."
-  (let ((default-directory (expand-file-name root))
-        (buffer (generate-new-buffer " *crit-magit-git-diff*")))
-    (unwind-protect
-        (progn
-          (call-process "git" nil buffer nil "diff" "HEAD")
-          (with-current-buffer buffer (buffer-string)))
-      (kill-buffer buffer))))
+  "Return separate staged and unstaged patches in ROOT.
+Keep both layers even when they cancel out relative to HEAD.  This also
+works before the first commit.  Untracked files are not included."
+  (let ((staged (crit-magit--git-output
+                 root "diff" "--cached" "--no-ext-diff" "--no-textconv"
+                 "--no-color" "--binary" "--"))
+        (unstaged (crit-magit--git-output
+                   root "diff" "--no-ext-diff" "--no-textconv"
+                   "--no-color" "--binary" "--")))
+    (concat (unless (string-empty-p staged)
+              (concat "Staged changes (HEAD to index):\n" staged))
+            (unless (string-empty-p unstaged)
+              (concat "\nUnstaged changes (index to worktree):\n" unstaged)))))
+
+(defun crit-magit--buffer-diff ()
+  "Return the full displayed diff, including folded and narrowed text."
+  (save-restriction
+    (widen)
+    (buffer-substring-no-properties (point-min) (point-max))))
 
 (defun crit-magit--repository-root ()
   "Return the absolute path of the current repository root.
@@ -286,28 +320,42 @@ Signal an error if PATH resolves outside ROOT."
     (file-relative-name path-abs root-abs)))
 
 (defun crit-magit--file-at-point ()
-  "Return the file path at point in a diff buffer."
-  (or (and (fboundp 'magit-file-at-point) (magit-file-at-point))
-      (save-excursion
-        (beginning-of-line)
-        (when (re-search-backward "^+++ b/\\(.+\\)$" nil t)
-          (match-string-no-properties 1)))
+  "Return the file at point without falling back to a previous Magit section."
+  (or (and (fboundp 'magit-file-at-point) (magit-file-at-point t))
+      (unless (and (fboundp 'magit-current-section) (magit-current-section))
+        (save-excursion
+          (beginning-of-line)
+          (let ((limit (save-excursion
+                         (if (re-search-backward "^diff --git " nil t)
+                             (point) (point-min)))))
+            (when (or (looking-at "^[+][+][+] ")
+                      (re-search-backward "^[+][+][+] " limit t))
+              (cond
+               ((looking-at "[+][+][+] b/\\(.+\\)$")
+                (match-string-no-properties 1))
+               ((looking-at "[+][+][+] /dev/null$")
+                (when (re-search-backward "^--- a/\\(.+\\)$" limit t)
+                  (match-string-no-properties 1))))))))
       (user-error "No file at point")))
 
 (defun crit-magit--current-hunk-header ()
-  "Return the hunk header string at point, or nil if none is found."
-  (or (and (fboundp 'magit-current-section)
-           (let ((section (magit-current-section)))
-             (while (and section
-                         (not (eq (magit-section-type section) 'hunk)))
-               (setq section (magit-section-parent section)))
-             (and section (magit-section-value section))))
+  "Return the actual hunk header at point, without crossing file sections."
+  (let ((section (crit-magit--section 'hunk)))
+    (cond
+     (section
+      (save-excursion
+        (goto-char (crit-magit--section-slot section 'start))
+        (buffer-substring-no-properties (line-beginning-position)
+                                        (line-end-position))))
+     ((and (fboundp 'magit-current-section) (magit-current-section)) nil)
+     (t
       (save-excursion
         (beginning-of-line)
-        (when (re-search-backward
-               "^@@ -[0-9]+\\(?:,[0-9]+\\)? \\+[0-9]+\\(?:,[0-9]+\\)? @@"
-               nil t)
-          (match-string-no-properties 0)))))
+        (when (or (looking-at "^@@ ")
+                  (re-search-backward "^\\(?:@@ \\|diff --git \\|[+][+][+] \\|--- \\)" nil t))
+          (when (looking-at "^@@ ")
+            (buffer-substring-no-properties (line-beginning-position)
+                                            (line-end-position)))))))))
 
 (defun crit-magit--parse-hunk-header (header)
   "Parse hunk HEADER into (OLD-START NEW-START), or nil if invalid."
@@ -322,7 +370,8 @@ Signal an error if PATH resolves outside ROOT."
 Returns nil when HEADER is not present before point."
   (save-excursion
     (beginning-of-line)
-    (when (re-search-backward (regexp-quote header) nil t)
+    (when (or (looking-at (regexp-quote header))
+              (re-search-backward (concat "^" (regexp-quote header) "$") nil t))
       (forward-line 1)
       (point))))
 
@@ -332,7 +381,7 @@ CONTENT-START is the position of the first content line; OLD-START
 and NEW-START are the 1-based line numbers from the hunk header.
 SIDE is `added', `removed', or `context'.  Signal an error if the
 entry point is not on a hunk content line."
-  (let ((target (point)))
+  (let ((target (line-beginning-position)))
     (when (< target content-start)
       (user-error "Point is on the hunk header"))
     (save-excursion
@@ -343,8 +392,9 @@ entry point is not on a hunk content line."
           (pcase (char-after)
             (?+ (setq new (1+ new)))
             (?- (setq old (1+ old)))
-            (_ (setq old (1+ old)
-                     new (1+ new))))
+            (?\s (setq old (1+ old) new (1+ new)))
+            (?\\ nil)
+            (_ (user-error "Point leaves the diff hunk")))
           (forward-line 1))
         (pcase (char-after)
           ((and c (or ?+ ?- ?\s))
@@ -359,6 +409,7 @@ entry point is not on a hunk content line."
   "Return (MIN-LINE . MAX-LINE) of TARGET-SIDE lines between BEG and END.
 Returns nil when no line of TARGET-SIDE is present.  Signal an
 error if BEG precedes CONTENT-START or the range leaves the hunk."
+  (setq beg (save-excursion (goto-char beg) (line-beginning-position)))
   (when (< beg content-start)
     (user-error "Region includes the hunk header"))
   (save-excursion
@@ -370,23 +421,31 @@ error if BEG precedes CONTENT-START or the range leaves the hunk."
         (pcase (char-after)
           (?+ (setq new (1+ new)))
           (?- (setq old (1+ old)))
-          (_ (setq old (1+ old)
-                   new (1+ new))))
+          (?\s (setq old (1+ old) new (1+ new)))
+          (?\\ nil)
+          (_ (user-error "Region leaves the diff hunk")))
         (forward-line 1))
       (while (< (point) end)
         (pcase (char-after)
           ((and c (or ?+ ?- ?\s))
            (cond
             ((eq c ?+)
-             (when (eq target-side 'added) (push new lines))
+             (when (eq target-side 'removed)
+               (user-error "Select old or new lines separately"))
+             (unless (eq target-side 'removed) (push new lines))
              (setq new (1+ new)))
             ((eq c ?-)
+             (unless (eq target-side 'removed)
+               (user-error "Select old or new lines separately"))
              (when (eq target-side 'removed) (push old lines))
              (setq old (1+ old)))
             (t
-             (when (eq target-side 'context) (push new lines))
+             (when (eq target-side 'removed)
+               (user-error "Select removed lines separately from context"))
+             (push new lines)
              (setq old (1+ old)
                    new (1+ new)))))
+          (?\\ nil)
           (_ (user-error "Region leaves the diff hunk")))
         (forward-line 1))
       (when lines
@@ -405,6 +464,17 @@ characters are truncated."
       line)))
 
 (defun crit-magit--extract-diff-target ()
+  "Extract a target at the start of the selection, independent of its direction."
+  (let ((bounds (and (use-region-p)
+                     (cons (region-beginning) (region-end)))))
+    (save-mark-and-excursion
+      (when bounds
+        (goto-char (car bounds))
+        (set-mark (cdr bounds))
+        (activate-mark))
+      (crit-magit--extract-diff-target-at-point))))
+
+(defun crit-magit--extract-diff-target-at-point ()
   "Extract a review target from the current diff buffer.
 Uses the active region when present, otherwise the current line.
 Returns a plist with :repository, :commit, :base, :path,
@@ -526,10 +596,20 @@ Interactively, prompt for a safe single-component session name."
   (message "crit-magit: session set to %s" crit-magit-session-id))
 
 (defun crit-magit--session-file (root session-id)
-  "Return the configured absolute session file for ROOT and SESSION-ID."
-  (let ((file (funcall crit-magit-session-file-function root session-id)))
-    (unless (and (stringp file) (file-name-absolute-p file))
-      (user-error "Session file function must return an absolute file name"))
+  "Return a validated session file inside ROOT's session directory."
+  (crit-magit--validate-session-id session-id)
+  (let* ((directory (expand-file-name
+                     (crit-magit--validate-path-component
+                      crit-magit-session-directory-name "session directory name")
+                     root))
+         (file (funcall crit-magit-session-file-function root session-id)))
+    (unless (and (stringp file) (file-name-absolute-p file)
+                 (equal (file-name-directory (expand-file-name file))
+                        (file-name-as-directory directory)))
+      (user-error "Session file must be directly inside %s" directory))
+    (when (or (file-symlink-p directory) (file-symlink-p file)
+              (file-directory-p file))
+      (user-error "Refusing symlink or directory session path: %s" file))
     (expand-file-name file)))
 
 (defun crit-magit--read-file (file)
@@ -538,20 +618,25 @@ Interactively, prompt for a safe single-component session name."
     (insert-file-contents file)
     (buffer-string)))
 
-(defun crit-magit--atomic-write (file content)
+(defun crit-magit--atomic-write (file content &optional coding)
   "Atomically write CONTENT as UTF-8 to FILE.
-Reject symlinks and directories instead of replacing them."
+Reject symlinks and directories; preserve optional CODING when supplied."
   (when (file-symlink-p file)
     (user-error "Refusing to replace symlink: %s" file))
   (when (file-directory-p file)
     (user-error "Refusing to replace directory: %s" file))
+  (when (and (file-exists-p file) (not (file-writable-p file)))
+    (user-error "Cannot write file: %s" file))
+  (when-let ((buffer (find-buffer-visiting file)))
+    (when (buffer-modified-p buffer)
+      (user-error "Save or revert the modified session buffer first: %s" file)))
   (let* ((directory (file-name-directory file))
          (temporary (make-temp-file
                      (expand-file-name ".crit-magit-write-" directory))))
     (unwind-protect
         (progn
           (with-temp-file temporary
-            (set-buffer-file-coding-system 'utf-8-unix)
+            (set-buffer-file-coding-system (or coding 'utf-8-unix))
             (insert content))
           (when (file-exists-p file)
             (set-file-modes temporary (file-modes file)))
@@ -567,43 +652,42 @@ Reject symlinks and directories instead of replacing them."
           "/"))
 
 (defun crit-magit--ensure-gitignore (root)
-  "Ensure ROOT's gitignore protects the crit-magit session directory."
+  "Ensure ROOT's gitignore protects the session directory, preserving coding."
   (let* ((file (expand-file-name ".gitignore" root))
          (entry (crit-magit--gitignore-entry))
-         (exists (file-exists-p file))
-         (content (if exists (crit-magit--read-file file) "")))
-    (when (file-symlink-p file)
-      (user-error "Refusing to modify symlink: %s" file))
-    (when (file-directory-p file)
-      (user-error "Refusing to modify directory: %s" file))
+         (content "")
+         (coding 'utf-8-unix))
+    (when (or (file-symlink-p file) (file-directory-p file))
+      (user-error "Refusing symlink or directory .gitignore: %s" file))
+    (when (file-exists-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (setq content (buffer-string) coding buffer-file-coding-system)))
     (unless (member entry (split-string content "\n" t))
       (if crit-magit-auto-update-gitignore
           (progn
-            (when (and exists (not (file-writable-p file)))
-              (user-error "Cannot write .gitignore: %s" file))
             (crit-magit--atomic-write
-             file
-             (cond
-              ((string-empty-p content) (concat entry "\n"))
-              ((string-suffix-p "\n" content) (concat content entry "\n"))
-              (t (concat content "\n" entry "\n"))))
+             file (concat content
+                          (unless (or (string-empty-p content)
+                                      (string-suffix-p "\n" content)) "\n")
+                          entry "\n")
+             coding)
             (message "crit-magit: added %s to %s" entry file))
         (display-warning
          'crit-magit
-         (format "%s is not ignored; session files may be tracked by Git"
-                 entry)
+         (format "%s is not ignored; session files may be tracked by Git" entry)
          :warning)))))
 
 (defun crit-magit--prepare-session-file (root session-id)
   "Return (FILE . CONTENT) for a validated session under ROOT.
 Create the session directory and header content when FILE is new."
-  (crit-magit--ensure-gitignore root)
   (let* ((directory (expand-file-name
                      (crit-magit--validate-path-component
                       crit-magit-session-directory-name
                       "session directory name")
                      root))
          (file (crit-magit--session-file root session-id)))
+    (crit-magit--ensure-gitignore root)
     (when (file-symlink-p directory)
       (user-error "Refusing to use symlink session directory: %s" directory))
     (cond
@@ -701,18 +785,25 @@ The target must already have been extracted from the current diff buffer."
                 crit-magit-comment-size-limit))
   (let* ((root (plist-get target :repository))
          (session-id (crit-magit--session-id))
-         (prepared (crit-magit--prepare-session-file root session-id))
-         (file (car prepared))
-         (content (cdr prepared))
-         (comment-id (crit-magit--comment-id))
-         (new-content (concat content
-                              (crit-magit--format-comment
-                               target session-id body comment-id))))
-    (crit-magit--atomic-write file new-content)
-    (list :file file
-          :id comment-id
-          :count (crit-magit--unresolved-comment-count new-content)
-          :session-id session-id)))
+         (file (crit-magit--session-file root session-id))
+         (lock (concat file ".lock")))
+    (make-directory (file-name-directory file) t)
+    ;; Atomic directory creation serializes the entire read/append/replace cycle.
+    (condition-case nil
+        (make-directory lock)
+      (file-already-exists
+       (user-error "Session is locked by another writer: %s" lock)))
+    (unwind-protect
+        (let* ((prepared (crit-magit--prepare-session-file root session-id))
+               (comment-id (crit-magit--comment-id))
+               (new-content (concat (cdr prepared)
+                                    (crit-magit--format-comment
+                                     target session-id body comment-id))))
+          (crit-magit--atomic-write file new-content)
+          (list :file file :id comment-id
+                :count (crit-magit--unresolved-comment-count new-content)
+                :session-id session-id))
+      (delete-directory lock))))
 
 (defun crit-magit--dsh-running-p ()
   "Return non-nil when a DSH process is currently running."
@@ -885,15 +976,17 @@ Only the standard select option whose id is `model' is accepted."
   "Finish ACP discovery STATE with OUTCOME and clean up PROCESS."
   (unless (plist-get state :finished)
     (setf (plist-get state :finished) t)
+    (when-let ((timer (plist-get state :timer))) (cancel-timer timer))
     (crit-magit--clear-dsh-process process)
     (set-process-query-on-exit-flag process nil)
     (when (process-live-p process)
-      (process-send-eof process))
+      (delete-process process))
     (let ((stderr-buffer (plist-get state :stderr-buffer)))
       (when (buffer-live-p stderr-buffer)
         (let ((kill-buffer-query-functions nil))
           (kill-buffer stderr-buffer))))
-    (funcall callback outcome)))
+    ;; Never enter a minibuffer or start another process from a process filter.
+    (run-at-time 0 nil callback outcome)))
 
 (defun crit-magit--acp-failure (process state callback message)
   "Finish ACP discovery with an error MESSAGE and stderr context."
@@ -908,13 +1001,32 @@ Only the standard select option whose id is `model' is accepted."
 (defun crit-magit--acp-handle-message (process state callback message)
   "Handle one parsed ACP MESSAGE during model discovery."
   (let ((id (crit-magit--json-object-value message "id")))
-    (when id
+    (cond
+     ((plist-get state :finished) nil)
+     ((crit-magit--json-object-value message "method")
+      (when id
+        (process-send-string
+         process
+         (concat (json-encode
+                  `((jsonrpc . "2.0") (id . ,id)
+                    (error . ((code . -32601)
+                              (message . "Unsupported client method")))))
+                 "\n"))))
+     (id
       (if (crit-magit--json-object-value message "error")
-          (crit-magit--acp-failure
-           process state callback
-           (or (crit-magit--json-object-value
-                (crit-magit--json-object-value message "error") "message")
-               "DSH ACP request failed"))
+          (if (and (eq (plist-get state :phase) 'close-session)
+                   (equal id (plist-get state :expected-id))
+                   (equal (crit-magit--json-object-value
+                           (crit-magit--json-object-value message "error") "code")
+                          -32601))
+              ;; Closing is optional; the captured model list is already complete.
+              (crit-magit--acp-finish
+               process state callback (cons 'success (plist-get state :options)))
+            (crit-magit--acp-failure
+             process state callback
+             (or (crit-magit--json-object-value
+                  (crit-magit--json-object-value message "error") "message")
+                 "DSH ACP request failed")))
         (pcase (plist-get state :phase)
           ('initialize
            (if (not (equal id (plist-get state :expected-id)))
@@ -963,7 +1075,7 @@ Only the standard select option whose id is `model' is accepted."
              (crit-magit--acp-finish
               process state callback
               (cons 'success (plist-get state :options)))))
-          (_ nil))))))
+          (_ nil)))))))
 
 (defun crit-magit--acp-filter (process state callback chunk)
   "Parse newline-delimited ACP JSON CHUNK for PROCESS."
@@ -971,7 +1083,8 @@ Only the standard select option whose id is `model' is accepted."
         (concat (plist-get state :input) chunk))
   (let ((input (plist-get state :input))
         (start 0))
-    (while (string-match "\n" input start)
+    (while (and (not (plist-get state :finished))
+                (string-match "\n" input start))
       (let ((line (substring input start (match-beginning 0))))
         (setq start (match-end 0))
         (unless (string-empty-p line)
@@ -1005,7 +1118,7 @@ Only the standard select option whose id is `model' is accepted."
                       :options nil
                       :session-id nil
                       :stderr-buffer stderr-buffer
-                      :finished nil))
+                      :finished nil :timer nil))
          (default-directory (expand-file-name root)))
     (condition-case error-data
         (let ((process
@@ -1015,6 +1128,8 @@ Only the standard select option whose id is `model' is accepted."
                 :command (list crit-magit-dsh-command
                                "--profile" crit-magit-dsh-acp-profile)
                 :stderr stderr-buffer
+                :coding 'utf-8-unix
+                :noquery t
                 :connection-type 'pipe
                 :filter (lambda (proc chunk)
                           (crit-magit--acp-filter proc state callback chunk))
@@ -1022,6 +1137,10 @@ Only the standard select option whose id is `model' is accepted."
                             (crit-magit--acp-sentinel
                              proc state callback event)))))
           (crit-magit--set-dsh-process process 'model-discovery)
+          (setf (plist-get state :timer)
+                (run-at-time crit-magit-dsh-discovery-timeout nil
+                             #'crit-magit--acp-failure process state callback
+                             "DSH ACP model discovery timed out"))
           (condition-case send-error
               (crit-magit--acp-send
                process 1 "initialize"
@@ -1056,32 +1175,27 @@ Accept an ACP selection pair or a legacy label from
   (concat "'" (replace-regexp-in-string "'" "''" value t t) "'"))
 
 (defun crit-magit--dsh-model-patch-file (provider model)
-  "Return a temporary patch overriding the DSH default model, or nil.
-When PROVIDER and MODEL equal the selection of
-`crit-magit-dsh-default-model', return nil and write nothing.
-Otherwise write a temporary cordis.patch.yml that overrides the
-`agent-default-model' row and return its absolute file name."
-  (let* ((default-entry (crit-magit--dsh-model-entry
-                         crit-magit-dsh-default-model)))
-    (when (or (not (equal provider (car default-entry)))
-              (not (equal model (cdr default-entry))))
-      (let ((file (make-temp-file "crit-magit-dsh-" nil ".yml")))
-        (with-temp-file file
-          (insert "- id: agent-default-model\n")
-          (insert "  name: '@deepseek-ai/dsh-agent-default-model'\n")
-          (insert "  config:\n")
-          (insert (format "    provider: %s\n"
-                         (crit-magit--yaml-string provider)))
-          (insert (format "    model: %s\n"
-                         (crit-magit--yaml-string model))))
-        file))))
+  "Write an explicit PROVIDER and MODEL override for every selection.
+The headless profile default cannot be inferred from a local label or ACP."
+  (let ((file (make-temp-file "crit-magit-dsh-" nil ".yml")))
+    (condition-case err
+        (progn
+          (with-temp-file file
+            (set-buffer-file-coding-system 'utf-8-unix)
+            (insert "- id: agent-default-model\n"
+                    "  name: '@deepseek-ai/dsh-agent-default-model'\n"
+                    "  config:\n"
+                    (format "    provider: %s\n" (crit-magit--yaml-string provider))
+                    (format "    model: %s\n" (crit-magit--yaml-string model))))
+          file)
+      (error (delete-file file) (signal (car err) (cdr err))))))
 
 (defun crit-magit--dsh-argv (prompt model)
   "Return (ARGV . PATCH-FILE) for a DSH one-shot review.
 PROMPT is the task text passed as the positional argument.
-MODEL is a provider/model pair or a legacy model label.  A non-default
-model adds `--patch' with a temporary override file.  PATCH-FILE is that file
-to delete after the run, or nil."
+MODEL is a provider/model pair or a legacy model label.  Every selection
+adds `--patch' with a temporary override file.  PATCH-FILE is deleted after
+the run."
   (let* ((entry (crit-magit--dsh-selection model))
          (patch-file (crit-magit--dsh-model-patch-file
                       (car entry) (cdr entry))))
@@ -1096,7 +1210,9 @@ to delete after the run, or nil."
 STATUS is `success' with STDOUT when EXIT-STATUS is 0; otherwise
 STATUS is `error' with STDERR (or STDOUT when STDERR is empty)."
   (if (and (integerp exit-status) (zerop exit-status))
-      (cons 'success stdout)
+      (if (string-empty-p (string-trim (or stdout "")))
+          (cons 'error (concat "DSH exited without a review response.\n" stderr))
+        (cons 'success stdout))
     (cons 'error (if (and stderr (not (string-empty-p stderr)))
                      stderr
                    stdout))))
@@ -1106,11 +1222,15 @@ STATUS is `error' with STDERR (or STDOUT when STDERR is empty)."
   "Handle exit of DSH process PROC.
 Call CALLBACK with (STATUS . TEXT) from `crit-magit--dsh-outcome',
 then clean up the temporary patch file and output buffers."
-  (when (memq (process-status proc) '(exit signal))
+  (when (and (memq (process-status proc) '(exit signal))
+             (not (process-get proc 'crit-magit-finished)))
+    (process-put proc 'crit-magit-finished t)
     (unwind-protect
         (let ((exit-status (process-exit-status proc))
-              (stdout (with-current-buffer stdout-buffer (buffer-string)))
-              (stderr (with-current-buffer stderr-buffer (buffer-string))))
+              (stdout (if (buffer-live-p stdout-buffer)
+                          (with-current-buffer stdout-buffer (buffer-string)) ""))
+              (stderr (if (buffer-live-p stderr-buffer)
+                          (with-current-buffer stderr-buffer (buffer-string)) "")))
           (crit-magit--clear-dsh-process proc)
           (funcall callback (crit-magit--dsh-outcome
                              exit-status stdout stderr)))
@@ -1140,6 +1260,8 @@ called with (STATUS . TEXT) when the process exits."
                 :buffer stdout-buffer
                 :command argv
                 :stderr stderr-buffer
+                :coding 'utf-8-unix
+                :noquery t
                 :connection-type 'pipe
                 :sentinel (lambda (proc _event)
                             (crit-magit--dsh-sentinel
@@ -1154,19 +1276,21 @@ called with (STATUS . TEXT) when the process exits."
          (delete-file patch-file))
        (signal (car error-data) (cdr error-data))))))
 
+(defun crit-magit-cancel-review ()
+  "Cancel active ACP discovery or DSH review and release request resources."
+  (interactive)
+  (unless (crit-magit--dsh-running-p)
+    (user-error "No DSH request is running"))
+  (delete-process crit-magit--dsh-process))
+
 ;;;; DSH review prompt
 
 (defun crit-magit--review-content-block (content)
-  "Return CONTENT as an inline diff block, bounded by the size limit.
-When CONTENT exceeds `crit-magit-dsh-inline-size-limit' characters,
-return instead an instruction to run `git diff' in the repository."
-  (if (<= (length content) crit-magit-dsh-inline-size-limit)
-      (format "```diff\n%s\n```\n" content)
-    (concat "The diff is too large to inline; run `git diff' in the "
-            "repository root and review the changes.\n")))
+  "Return CONTENT intact as review evidence."
+  (concat "BEGIN CAPTURED DIFF\n" content "\nEND CAPTURED DIFF\n"))
 
 (defun crit-magit--build-review-prompt (target &optional whole-content)
-  "Build a bounded review prompt for TARGET or WHOLE-CONTENT.
+  "Build a complete review prompt for TARGET or WHOLE-CONTENT.
 TARGET is a review-target plist from `crit-magit--extract-diff-target'
 or `crit-magit--extract-file-target'.  When TARGET is nil, WHOLE-CONTENT
 must be a non-empty diff buffer string.  Signal `user-error' when both
@@ -1183,37 +1307,54 @@ yield no content."
                           (t (format "lines %s-%s" start end)))))
         (concat
          "You are reviewing code changes in a Git repository. "
-         "The working directory is the repository root.\n\n"
+         "The working directory is the repository root.\n"
+         "Review only; do not modify files, commit, or push.\n\n"
          (format "File: %s\n" path)
          (format "Location: %s\n" lines)
          (format "Side: %s\n" side)
          (format "Commit: %s\n" commit)
          (format "Base: %s\n\n" base)
          (crit-magit--review-content-block
-          (or (plist-get target :context) ""))))
+          (or whole-content (plist-get target :context) ""))))
     (if (and whole-content (not (string-empty-p whole-content)))
         (concat
          "You are reviewing all changes in the current diff. "
-         "The working directory is the repository root.\n\n"
+         "The working directory is the repository root.\n"
+         "Review only; do not modify files, commit, or push.\n\n"
          (crit-magit--review-content-block whole-content))
        (user-error "No review target or diff content"))))
 
-(defun crit-magit--build-session-review-prompt (root session-file)
+(defun crit-magit--build-session-review-prompt (root session-file &optional content diff)
   "Build a DSH prompt to process unresolved comments in SESSION-FILE.
-ROOT is the repository working directory."
+ROOT is the repository working directory; CONTENT and DIFF are snapshots."
   (format
    (concat
     "You are addressing source-review comments in a Git repository.\n\n"
     "Repository root: %s\n"
     "Session file: %s\n\n"
-    "Read the session file and process every comment whose status is unresolved. "
+    "Process every unresolved comment in the captured session below. "
     "For each comment, inspect the current source and diff, make the requested "
     "source changes when appropriate, and do not edit the session file itself. "
     "After applying changes, review the resulting git diff again and run the "
     "relevant tests or checks. Report each comment ID, the action taken, tests "
-    "run, and any remaining concern. Do not commit or push changes.")
+    "run, and any remaining concern. Do not commit or push changes.\n\n"
+    "BEGIN CAPTURED SESSION\n%s\nEND CAPTURED SESSION\n\n%s")
    (expand-file-name root)
-   (expand-file-name session-file)))
+   (expand-file-name session-file)
+   (or content (crit-magit--read-file session-file))
+   (crit-magit--review-content-block
+    (or diff (crit-magit--working-tree-diff root)))))
+
+(defun crit-magit--current-session-context (root)
+  "Return captured comments for ROOT's selected session, when it exists."
+  (when crit-magit-session-id
+    (let ((file (crit-magit--session-file root crit-magit-session-id)))
+      (when (file-exists-p file)
+        (let ((content (crit-magit--read-file file)))
+          (unless (crit-magit--session-header-p content crit-magit-session-id)
+            (user-error "Invalid session file: %s" file))
+          (concat "\nConsider the unresolved comments below in this review.\n"
+                  "BEGIN CAPTURED SESSION\n" content "\nEND CAPTURED SESSION\n"))))))
 
 ;;;; DSH review commands
 
@@ -1245,7 +1386,32 @@ STATUS is `success' or `error'.  TEXT is shown in
     (crit-magit--show-review (cons 'error message-text))))
 
 (defun crit-magit--request-review (prompt root)
-  "Discover ACP models, choose one, then send PROMPT to DSH under ROOT."
+  "Send a complete captured PROMPT to DSH under ROOT.
+Use a private UTF-8 request file when command-line transport is too large."
+  (when (crit-magit--dsh-running-p)
+    (user-error "A DSH review is already running"))
+  (let ((file nil))
+    (condition-case err
+        (progn
+          (when (> (string-bytes (encode-coding-string prompt 'utf-8-unix))
+                   crit-magit-dsh-inline-size-limit)
+            (setq file (make-temp-file "crit-magit-request-" nil ".md"))
+            (with-temp-file file
+              (set-buffer-file-coding-system 'utf-8-unix)
+              (insert prompt))
+            (setq prompt
+                  (format "Read the complete review request in %s. Follow its instructions and review all captured diff and comments; do not substitute a fresh git diff for the captured evidence."
+                          (json-encode-string file))))
+          (crit-magit--request-review-dispatch
+           prompt root
+           (lambda ()
+             (when (and file (file-exists-p file)) (delete-file file)))))
+      ((error quit)
+       (when (and file (file-exists-p file)) (delete-file file))
+       (signal (car err) (cdr err))))))
+
+(defun crit-magit--request-review-dispatch (prompt root cleanup)
+  "Discover a model, send PROMPT under ROOT, and call CLEANUP when finished."
   (when (crit-magit--dsh-running-p)
     (user-error "A DSH review is already running"))
   (message "crit-magit: discovering models through DSH ACP...")
@@ -1260,17 +1426,24 @@ STATUS is `success' or `error'.  TEXT is shown in
                    (message "crit-magit: requesting review (%s)..."
                             (crit-magit--dsh-selection-label selection))
                    (crit-magit--start-dsh
-                    prompt selection root #'crit-magit--show-review))
+                    prompt selection root
+                    (lambda (result)
+                      (unwind-protect (crit-magit--show-review result)
+                        (funcall cleanup)))))
                (quit
+                (funcall cleanup)
                 (message "crit-magit: model selection canceled"))
                (error
+                (funcall cleanup)
                 (crit-magit--show-review-error
-                 "Model selection failed:\n\n%s"
+                 "Model selection or review startup failed:\n\n%s"
                  (error-message-string selection-error))))
+           (funcall cleanup)
            (crit-magit--show-review-error
             "DSH ACP model discovery failed:\n\n%s"
             (cdr outcome)))))
     (error
+     (funcall cleanup)
      (crit-magit--show-review-error
       "DSH ACP model discovery failed:\n\n%s"
       (error-message-string error-data)))))
@@ -1287,7 +1460,11 @@ SESSION-ID is used to validate the session header before dispatch."
     (when (zerop (crit-magit--unresolved-comment-count content))
       (user-error "Session has no unresolved comments: %s" session-file))
     (crit-magit--request-review
-     (crit-magit--build-session-review-prompt root session-file)
+     (crit-magit--build-session-review-prompt
+      root session-file content
+      (if (derived-mode-p 'magit-diff-mode)
+          (crit-magit--buffer-diff)
+        (crit-magit--working-tree-diff root)))
      root)))
 
 (defun crit-magit-review-session ()
@@ -1316,7 +1493,9 @@ after the comment has been durably written."
      (if (= (plist-get result :count) 1) "" "s")
      session-file)
     (when crit-magit-review-after-comment
-      (crit-magit--review-session-file root session-id session-file))))
+      (if (crit-magit--dsh-running-p)
+          (message "crit-magit: comment saved; DSH is busy. Send it later with crit-magit-review-session")
+        (crit-magit--review-session-file root session-id session-file)))))
 
 (defun crit-magit-comment ()
   "Attach a review comment to the current diff line or active region.
@@ -1408,8 +1587,13 @@ one.  The last selection is offered first next time."
   (interactive)
   (crit-magit--assert-diff-buffer)
   (let* ((root (crit-magit--repository-root))
-         (target (crit-magit--extract-diff-target))
-         (prompt (crit-magit--build-review-prompt target)))
+         (target (if (and (crit-magit--section 'file)
+                          (not (crit-magit--section 'hunk))
+                          (not (use-region-p)))
+                     (crit-magit--extract-file-target)
+                   (crit-magit--extract-diff-target)))
+         (prompt (crit-magit--build-review-prompt
+                  target (crit-magit--buffer-diff))))
      (crit-magit--request-review prompt root)))
 
 (defun crit-magit-review-whole ()
@@ -1423,8 +1607,9 @@ status buffer the working-tree diff (staged and unstaged) is
   (let* ((root (crit-magit--repository-root))
          (content (if (derived-mode-p 'magit-status-mode)
                       (crit-magit--working-tree-diff root)
-                    (buffer-string)))
-         (prompt (crit-magit--build-review-prompt nil content)))
+                    (crit-magit--buffer-diff)))
+         (prompt (concat (crit-magit--build-review-prompt nil content)
+                         (crit-magit--current-session-context root))))
      (crit-magit--request-review prompt root)))
 
 (provide 'crit-magit)

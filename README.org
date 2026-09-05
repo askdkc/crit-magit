@@ -25,6 +25,8 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
              ("C-c m" . crit-magit-set-dsh-model))
           (:map magit-status-mode-map
              ("C-c r" . crit-magit-review-whole)
+             ("C-c c" . crit-magit-comment)
+             ("C-c f" . crit-magit-comment-file)
              ("C-c s" . crit-magit-review-session)
              ("C-c m" . crit-magit-set-dsh-model)))
 #+end_src
@@ -58,9 +60,30 @@ Magit の diff バッファから、ローカルで稼働する DSH（DeepSeek H
 送信前に DSH の ACP プロファイルへ接続して利用可能なモデル一覧を取得し、
 選択した provider/model を headless プロファイル（ワンショット実行）へ渡します。
 
-- =M-x crit-magit-review= — 現在行／選択範囲／ファイルのレビュー対象を DSH へ送る（diff バッファ専用）
+- =M-x crit-magit-review= — 現在行／選択範囲／ファイルのレビュー対象を DSH へ送る（diff／status の展開済み差分上）
 - =M-x crit-magit-review-whole= — 全体を DSH へ送る（diff バッファはバッファ全体、status バッファはワーキングツリー全体の diff）
 - =M-x crit-magit-set-dsh-model= — DSH ACP からモデル一覧を取得して選択する
+
+** 全体レビューに渡す内容
+
+=crit-magit-review-whole= は、diff バッファでは折り畳み・narrowing の内側も
+含めたバッファ全文、status バッファでは staged／unstaged を分けた全差分を
+取得します。未追跡ファイルは含みません。現在のセッションが選択され、保存済み
+ファイルが存在する場合は、そのコメント全文も一緒に渡します。
+
+送信対象は操作時点で固定します。長い依頼も切り捨てず、UTF-8 の一時ファイルに
+保存して DSH にその全文を読むよう指示します。DSH はこのローカル一時ファイルを
+読める必要があります。完了・失敗・キャンセル時に一時ファイルを削除します。
+全体レビューと対象レビューはレビュー専用で、ソースを変更しないよう指示します。
+
+=crit-magit-cancel-review= で実行中の依頼を中止できます。モデル一覧取得は
+既定で30秒でタイムアウトし、=crit-magit-dsh-discovery-timeout= で変更できます。
+
+ACP は標準入出力による接続です。crit-magit が依頼ごとに DSH を起動するため、
+別ターミナルで =pnpm dsh --profile acp= を常駐させておく必要はありません。
+端末で起動できても Emacs の PATH に =dsh= がない場合は、上記の
+=crit-magit-dsh-command= に =bin.js= の絶対パスを設定してください。
+=bin.js= の起動には Emacs から =node= も実行できる必要があります。
 
 ** モデルの選択
 
@@ -71,9 +94,9 @@ provider/model は、既定で =~/.emacs.d/crit-magit-dsh-model.json= に保存�
 DSH 側で追加・削除されたモデルも反映されます。
 
 従来の =crit-magit-dsh-models= と =crit-magit-dsh-default-model= は、ACP を
-使わないプログラム呼び出しや既定値比較のためのフォールバックとして残ります。
-選択した provider/model が DSH の既定値と異なる場合だけ、実行時に一時的な
-=--patch= 上書きファイルを生成します。
+使わないプログラム呼び出しのフォールバックとして残ります。選択した
+provider/model は毎回 =--patch= で明示します。Emacs 側の既定ラベルと
+DSH headless 側の設定が異なっていても、選択したモデルを渡します。
 
 ** 前提条件
 
@@ -104,8 +127,41 @@ DSH 側で追加・削除されたモデルも反映されます。
 =crit-magit-review-after-comment= は既定で有効です。コメントを保存すると、
 ACP でモデルを選択した後、DSH が未解決コメントを読み、必要なソース変更と
 再レビューを行います。DSH はセッションファイル自体を編集せず、commit や
-push も実行しません。コメント本文とセッションファイルには、認証情報などの
-秘密情報を記録しないでください。
+push もしないよう指示します。DSH の出力を確認してから変更を採用してください。
+
+コメントをまとめてから送る場合は =(setq crit-magit-review-after-comment nil)=
+を設定し、コメントを追加後、=crit-magit-review-whole= で全diffとコメントを
+レビューさせるか、=crit-magit-review-session= でコメントへの対応を依頼します。
+DSH の実行中に追加したコメントは保存し、後で =crit-magit-review-session= から
+再送できます。実行中の依頼へ自動追加はしません。
+
+行範囲は同じ hunk 内で指定します。追加側と削除側を混在させた範囲は、
+一部だけを黙って送らずエラーにします。両側への指摘はファイルコメントを使ってください。
+コメント保存は読み取りから置換までロックします。異常終了で
+=.critmagit/<session-id>.md.lock/= が残った場合は、他の書き込みが動いていない
+ことを確認してから、その空ディレクトリを削除してください。
+
+** 検証
+
+通常の単体・プロセステスト（実際のAIには接続しません）:
+
+#+begin_src sh
+emacs -Q --batch -L . -l crit-magit-regression-test.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L . --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile crit-magit.el
+#+end_src
+
+Magit を load-path に設定して同じテストを実行すると、一時Gitリポジトリ上で
+実際の diff／status バッファ、コメント保存、全体レビュー、セッション再送も
+検証します。Magit がない場合、この統合テストは skipped として表示されます。
+プロセステストの =tests/fake-dsh.py= には Python 3 が必要です。
+
+実DSHとの疎通は =tests/live-dsh.el= で明示的に検証できます。これは実際の
+モデルを利用するため、通常のテストには含めません。Magit を load-path に
+設定した状態で、=CRIT_MAGIT_LIVE_DSH= にDSH実行ファイルの絶対パスを指定し、
+=-L . -l tests/live-dsh.el= を付けてバッチ実行します。
+一時リポジトリの約20KBのdiffと日本語コメントを送り、応答内のコメントID・
+diff末尾の確認文字列・ゼロ除算の指摘、およびソースが未変更であることを確認します。
+
 
 * ライセンス
 

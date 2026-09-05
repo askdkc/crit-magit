@@ -309,10 +309,14 @@
                 :type 'user-error))
 
 (ert-deftest crit-magit-dsh-model-patch-default ()
-  "Default model produces no patch file."
+  "Even a locally default label must override a different DSH profile default."
   :tags '(crit-magit-dsh-transport)
-  (should (null (crit-magit--dsh-model-patch-file
-                 "deepseek-official" "deepseek-v4-flash"))))
+  (let ((file (crit-magit--dsh-model-patch-file
+               "deepseek-official" "deepseek-v4-flash")))
+    (unwind-protect
+        (should (string-match-p "model: 'deepseek-v4-flash'"
+                                (crit-magit--read-file file)))
+      (delete-file file))))
 
 (ert-deftest crit-magit-dsh-model-patch-nondefault ()
   "Non-default model writes a patch overriding agent-default-model."
@@ -334,16 +338,17 @@
         (delete-file file)))))
 
 (ert-deftest crit-magit-dsh-argv-default ()
-  "Default model builds argv without --patch."
+  "Default model is passed explicitly using --patch."
   :tags '(crit-magit-dsh-transport)
   (let* ((pair (crit-magit--dsh-argv "review me" "DeepSeek-V4-Flash"))
          (argv (car pair))
          (patch (cdr pair)))
     (unwind-protect
         (progn
-          (should (null patch))
+          (should patch)
           (should (equal argv
-                         (list "dsh" "--profile" "headless" "review me"))))
+                         (list "dsh" "--profile" "headless"
+                               "--patch" patch "review me"))))
       (when (and patch (file-exists-p patch))
         (delete-file patch)))))
 
@@ -414,13 +419,13 @@
     (should (string-match-p "diff --git a/x b/x" prompt))))
 
 (ert-deftest crit-magit-dsh-prompt-oversize ()
-  "Oversized content switches to a git diff instruction."
+  "Oversized content remains intact for the request-file transport."
   :tags '(crit-magit-dsh-prompt)
   (let ((crit-magit-dsh-inline-size-limit 10))
     (let ((prompt (crit-magit--build-review-prompt
                    nil "this is a long diff that exceeds the limit")))
-      (should (string-match-p "git diff" prompt))
-      (should (not (string-match-p "long diff" prompt))))))
+      (should (string-match-p "this is a long diff that exceeds the limit" prompt))
+      (should-not (string-match-p "run `git diff'" prompt)))))
 
 (ert-deftest crit-magit-dsh-prompt-empty ()
   "No target and empty content signal an error."
@@ -697,7 +702,8 @@
   "Tell DSH where the session is and require a post-change re-review."
   :tags '(crit-magit-session)
   (let ((prompt (crit-magit--build-session-review-prompt
-                 "/tmp/repo" "/tmp/repo/.critmagit/review.md")))
+                 "/tmp/repo" "/tmp/repo/.critmagit/review.md"
+                 "- status: unresolved\n> comment" "+captured diff")))
     (should (string-match-p "Repository root: /tmp/repo" prompt))
     (should (string-match-p "Session file: /tmp/repo/.critmagit/review.md"
                             prompt))
