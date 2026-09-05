@@ -295,5 +295,180 @@
           (should-error (crit-magit--repository-root) :type 'user-error))
       (delete-directory tmp t))))
 
+;;;; DSH transport tests
+
+(ert-deftest crit-magit-dsh-model-entry ()
+  "Resolve DSH model labels to provider/model pairs."
+  :tags '(crit-magit-dsh-transport)
+  (should (equal (crit-magit--dsh-model-entry "DeepSeek-V4-Flash")
+                 (cons "deepseek-official" "deepseek-v4-flash")))
+  (should (equal (crit-magit--dsh-model-entry "DeepSeek-V4-Pro")
+                 (cons "deepseek-official" "deepseek-v4-pro")))
+  (should-error (crit-magit--dsh-model-entry "Not-A-Model")
+                :type 'user-error))
+
+(ert-deftest crit-magit-dsh-model-patch-default ()
+  "Default model produces no patch file."
+  :tags '(crit-magit-dsh-transport)
+  (should (null (crit-magit--dsh-model-patch-file
+                 "deepseek-official" "deepseek-v4-flash"))))
+
+(ert-deftest crit-magit-dsh-model-patch-nondefault ()
+  "Non-default model writes a patch overriding agent-default-model."
+  :tags '(crit-magit-dsh-transport)
+  (let ((file (crit-magit--dsh-model-patch-file
+               "deepseek-official" "deepseek-v4-pro")))
+    (unwind-protect
+        (progn
+          (should (and file (file-exists-p file)))
+          (let ((content (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))))
+            (should (string-match-p "id: agent-default-model" content))
+            (should (string-match-p
+                     "@deepseek-ai/dsh-agent-default-model" content))
+            (should (string-match-p "provider: deepseek-official" content))
+            (should (string-match-p "model: deepseek-v4-pro" content))))
+      (when (and file (file-exists-p file))
+        (delete-file file)))))
+
+(ert-deftest crit-magit-dsh-argv-default ()
+  "Default model builds argv without --patch."
+  :tags '(crit-magit-dsh-transport)
+  (let* ((pair (crit-magit--dsh-argv "review me" "DeepSeek-V4-Flash"))
+         (argv (car pair))
+         (patch (cdr pair)))
+    (unwind-protect
+        (progn
+          (should (null patch))
+          (should (equal argv
+                         (list "dsh" "--profile" "headless" "review me"))))
+      (when (and patch (file-exists-p patch))
+        (delete-file patch)))))
+
+(ert-deftest crit-magit-dsh-argv-nondefault ()
+  "Non-default model adds --patch with a temp file before the prompt."
+  :tags '(crit-magit-dsh-transport)
+  (let* ((pair (crit-magit--dsh-argv "review me" "DeepSeek-V4-Pro"))
+         (argv (car pair))
+         (patch (cdr pair)))
+    (unwind-protect
+        (progn
+          (should patch)
+          (should (file-exists-p patch))
+          (should (equal (nth 0 argv) "dsh"))
+          (should (equal (nth 1 argv) "--profile"))
+          (should (equal (nth 2 argv) "headless"))
+          (should (equal (nth 3 argv) "--patch"))
+          (should (equal (nth 4 argv) patch))
+          (should (equal (car (last argv)) "review me")))
+      (when (and patch (file-exists-p patch))
+        (delete-file patch)))))
+
+(ert-deftest crit-magit-dsh-outcome-success ()
+  "Exit 0 maps stdout to a success result."
+  :tags '(crit-magit-dsh-transport)
+  (should (equal (crit-magit--dsh-outcome 0 "answer" "")
+                 (cons 'success "answer"))))
+
+(ert-deftest crit-magit-dsh-outcome-error ()
+  "Non-zero exit maps stderr to an error result."
+  :tags '(crit-magit-dsh-transport)
+  (should (equal (crit-magit--dsh-outcome 1 "" "boom")
+                 (cons 'error "boom"))))
+
+;;;; DSH prompt tests
+
+(ert-deftest crit-magit-dsh-prompt-target ()
+  "Build a prompt from a review target plist."
+  :tags '(crit-magit-dsh-prompt)
+  (let ((target '(:path "src/auth.el"
+                  :start-line 21 :end-line 22 :side added
+                  :commit "HEAD" :base "main"
+                  :context "added line")))
+    (let ((prompt (crit-magit--build-review-prompt target)))
+      (should (stringp prompt))
+      (should (not (string-empty-p prompt)))
+      (should (string-match-p "File: src/auth.el" prompt))
+      (should (string-match-p "lines 21-22" prompt))
+      (should (string-match-p "Side: added" prompt))
+      (should (string-match-p "Commit: HEAD" prompt))
+      (should (string-match-p "Base: main" prompt))
+      (should (string-match-p "added line" prompt)))))
+
+(ert-deftest crit-magit-dsh-prompt-target-single-line ()
+  "A single-line target renders as \"line N\"."
+  :tags '(crit-magit-dsh-prompt)
+  (let ((target '(:path "src/auth.el"
+                  :start-line 21 :end-line 21 :side removed
+                  :commit "HEAD" :base "unknown"
+                  :context "removed")))
+    (let ((prompt (crit-magit--build-review-prompt target)))
+      (should (string-match-p "Location: line 21" prompt)))))
+
+(ert-deftest crit-magit-dsh-prompt-whole ()
+  "A whole-buffer prompt embeds the diff content."
+  :tags '(crit-magit-dsh-prompt)
+  (let ((prompt (crit-magit--build-review-prompt nil "diff --git a/x b/x\n")))
+    (should (string-match-p "diff --git a/x b/x" prompt))))
+
+(ert-deftest crit-magit-dsh-prompt-oversize ()
+  "Oversized content switches to a git diff instruction."
+  :tags '(crit-magit-dsh-prompt)
+  (let ((crit-magit-dsh-inline-size-limit 10))
+    (let ((prompt (crit-magit--build-review-prompt
+                   nil "this is a long diff that exceeds the limit")))
+      (should (string-match-p "git diff" prompt))
+      (should (not (string-match-p "long diff" prompt))))))
+
+(ert-deftest crit-magit-dsh-prompt-empty ()
+  "No target and empty content signal an error."
+  :tags '(crit-magit-dsh-prompt)
+  (should-error (crit-magit--build-review-prompt nil "")
+                :type 'user-error)
+  (should-error (crit-magit--build-review-prompt nil nil)
+                :type 'user-error))
+
+;;;; DSH command tests
+
+(ert-deftest crit-magit-dsh-command-buffer-name ()
+  "The review buffer name defcustom defaults correctly."
+  :tags '(crit-magit-dsh-command)
+  (should (equal crit-magit-dsh-review-buffer-name "*crit-magit-review*")))
+
+(ert-deftest crit-magit-dsh-command-set-model ()
+  "Setting a known model updates the default; unknown models error."
+  :tags '(crit-magit-dsh-command)
+  (let ((crit-magit-dsh-default-model "DeepSeek-V4-Flash"))
+    (crit-magit-set-dsh-model "DeepSeek-V4-Pro")
+    (should (equal crit-magit-dsh-default-model "DeepSeek-V4-Pro")))
+  (should-error (crit-magit-set-dsh-model "Not-A-Model")
+                :type 'user-error))
+
+(ert-deftest crit-magit-dsh-command-show-review-success ()
+  "A success outcome inserts the answer into the review buffer."
+  :tags '(crit-magit-dsh-command)
+  (crit-magit--show-review (cons 'success "answer text"))
+  (should (get-buffer crit-magit-dsh-review-buffer-name))
+  (with-current-buffer crit-magit-dsh-review-buffer-name
+    (should (string-match-p "answer text" (buffer-string))))
+  (kill-buffer crit-magit-dsh-review-buffer-name))
+
+(ert-deftest crit-magit-dsh-command-show-review-error ()
+  "An error outcome marks the review as failed."
+  :tags '(crit-magit-dsh-command)
+  (crit-magit--show-review (cons 'error "boom"))
+  (with-current-buffer crit-magit-dsh-review-buffer-name
+    (should (string-match-p "DSH review failed" (buffer-string)))
+    (should (string-match-p "boom" (buffer-string))))
+  (kill-buffer crit-magit-dsh-review-buffer-name))
+
+(ert-deftest crit-magit-dsh-command-not-diff-buffer ()
+  "Reviewing outside a Magit diff buffer signals user-error."
+  :tags '(crit-magit-dsh-command)
+  (with-temp-buffer
+    (should-error (crit-magit-review) :type 'user-error)
+    (should-error (crit-magit-review-whole) :type 'user-error)))
+
 (provide 'crit-magit-test)
 ;;; crit-magit-test.el ends here
