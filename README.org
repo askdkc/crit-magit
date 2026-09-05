@@ -11,19 +11,18 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
   :vc (:url "https://github.com/askdkc/crit-magit"
        :rev :newest)
   :after magit
-  :bind (:map magit-diff-mode-map
-              ("C-c c" . crit-magit-comment)
-              ("C-c m f" . crit-magit-comment-file)))
+  :bind ((:map magit-diff-mode-map
+           ("C-c r" . crit-magit-review)
+           ("C-c w r" . crit-magit-review-whole))
+         (:map magit-status-mode-map
+           ("C-c w r" . crit-magit-review-whole)))
 #+end_src
 
-これで =crit-magit= がインストールされ、Magit の diff バッファで次の
-ショートカットを使える設定になります。
+これで =crit-magit= がインストールされ、Magit で次のショートカットを
+使える設定になります。
 
-- =C-c c= — 現在行または選択範囲にコメント
-- =C-c m f= — 現在のファイル全体にコメント
-
-=global-map= の =C-c= に続く =f= は =elfeed= に割り当てられているため、
-Magit 内では競合しない =C-c m f= を使います。
+- =C-c r= — 現在行／選択範囲／ファイルを DSH へレビュー依頼（diff バッファ）
+- =C-c w r= — 全体を DSH へレビュー依頼（diff バッファ／status バッファ両対応）
 
 初回起動時に =use-package= の VC サポートが利用できない場合は、まず
 次を評価してください。
@@ -43,8 +42,8 @@ Magit の diff バッファから、ローカルで稼働する DSH（DeepSeek H
 へレビュー依頼を送り、結果を =*crit-magit-review*= バッファに表示できます。
 DSH は headless プロファイル（ワンショット実行）で起動されます。
 
-- =M-x crit-magit-review= — 現在行／選択範囲／ファイルのレビュー対象を DSH へ送る
-- =M-x crit-magit-review-whole= — 現在の diff バッファ全体を DSH へ送る
+- =M-x crit-magit-review= — 現在行／選択範囲／ファイルのレビュー対象を DSH へ送る（diff バッファ専用）
+- =M-x crit-magit-review-whole= — 全体を DSH へ送る（diff バッファはバッファ全体、status バッファはワーキングツリー全体の diff）
 - =M-x crit-magit-set-dsh-model= — DSH 側の AI モデルを選択肢から選んで設定する
 
 ** モデルの選択
@@ -63,8 +62,9 @@ DSH は headless プロファイル（ワンショット実行）で起動され
 
 * 注意
 
-現在のリポジトリでは上記の公開コマンドがまだ実装されていないため、
-ショートカット設定はコマンド実装後に有効になります。
+DSH レビューコマンド（=crit-magit-review= / =crit-magit-review-whole= /
+=crit-magit-set-dsh-model=）は実装済みです。一方、=crit-magit-comment= や
+=crit-magit-comment-file= などのコメント書き込みコマンドは未実装です。
 
 * ライセンス
 

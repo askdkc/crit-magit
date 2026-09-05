@@ -148,6 +148,25 @@ instructs the DSH agent to run `git diff' instead of inlining."
   (unless (derived-mode-p 'magit-diff-mode)
     (user-error "Not in a Magit diff buffer")))
 
+(defun crit-magit--assert-review-buffer ()
+  "Signal an error unless the current buffer is a Magit diff or status buffer.
+Return non-nil on success."
+  (unless (or (derived-mode-p 'magit-diff-mode)
+              (derived-mode-p 'magit-status-mode))
+    (user-error "Not in a Magit diff or status buffer"))
+  t)
+
+(defun crit-magit--working-tree-diff (root)
+  "Return the staged and unstaged diff of ROOT as a string.
+Uses `git diff HEAD'.  Return an empty string when git fails."
+  (let ((default-directory (expand-file-name root))
+        (buffer (generate-new-buffer " *crit-magit-git-diff*")))
+    (unwind-protect
+        (progn
+          (call-process "git" nil buffer nil "diff" "HEAD")
+          (with-current-buffer buffer (buffer-string)))
+      (kill-buffer buffer))))
+
 (defun crit-magit--repository-root ()
   "Return the absolute path of the current repository root.
 Signal an error if the root cannot be determined."
@@ -556,12 +575,17 @@ The model in `crit-magit-dsh-default-model' is used; set it with
                            #'crit-magit--show-review)))
 
 (defun crit-magit-review-whole ()
-  "Send the whole current diff buffer for DSH AI review.
-The model in `crit-magit-dsh-default-model' is used."
+  "Send the whole current diff for DSH AI review.
+In a Magit diff buffer the buffer content is reviewed; in a Magit
+status buffer the working-tree diff (staged and unstaged) is
+reviewed.  The model in `crit-magit-dsh-default-model' is used."
   (interactive)
-  (crit-magit--assert-diff-buffer)
+  (crit-magit--assert-review-buffer)
   (let* ((root (crit-magit--repository-root))
-         (prompt (crit-magit--build-review-prompt nil (buffer-string))))
+         (content (if (derived-mode-p 'magit-status-mode)
+                      (crit-magit--working-tree-diff root)
+                    (buffer-string)))
+         (prompt (crit-magit--build-review-prompt nil content)))
     (message "crit-magit: requesting whole-diff review (%s)..."
              crit-magit-dsh-default-model)
     (crit-magit--start-dsh prompt crit-magit-dsh-default-model root
