@@ -11,18 +11,33 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
   :vc (:url "https://github.com/askdkc/crit-magit"
        :rev :newest)
   :after magit
+  ;; dsh が PATH にない場合は、以下の :custom 設定を有効にして
+  ;; DSH checkout の場所を指定する。
+  ;; :custom
+  ;; (crit-magit-dsh-command
+  ;;  "/path/to/deepseek-harness/apps/cli/lib/bin.js")
   :bind ((:map magit-diff-mode-map
-           ("C-c r" . crit-magit-review)
-           ("C-c w r" . crit-magit-review-whole))
-         (:map magit-status-mode-map
-           ("C-c w r" . crit-magit-review-whole)))
+             ("C-c r" . crit-magit-review)
+             ("C-c w r" . crit-magit-review-whole)
+             ("C-c c" . crit-magit-comment)
+             ("C-c f" . crit-magit-comment-file)
+             ("C-c s" . crit-magit-review-session)
+             ("C-c m" . crit-magit-set-dsh-model))
+          (:map magit-status-mode-map
+             ("C-c r" . crit-magit-review-whole)
+             ("C-c s" . crit-magit-review-session)
+             ("C-c m" . crit-magit-set-dsh-model)))
 #+end_src
 
 これで =crit-magit= がインストールされ、Magit で次のショートカットを
 使える設定になります。
 
-- =C-c r= — 現在行／選択範囲／ファイルを DSH へレビュー依頼（diff バッファ）
-- =C-c w r= — 全体を DSH へレビュー依頼（diff バッファ／status バッファ両対応）
+- =C-c r= — diff バッファでは現在行／選択範囲／ファイル、status バッファでは全体を DSH へレビュー依頼
+- =C-c w r= — diff バッファ全体を DSH へレビュー依頼
+- =C-c c= — 現在行または選択範囲へレビューコメントを追加
+- =C-c f= — 現在ファイル全体へレビューコメントを追加
+- =C-c s= — 現在セッションの未解決コメントを DSH へ送る
+- =C-c m= — ACP から DSH モデル一覧を取得して選択
 
 初回起動時に =use-package= の VC サポートが利用できない場合は、まず
 次を評価してください。
@@ -40,31 +55,57 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
 
 Magit の diff バッファから、ローカルで稼働する DSH（DeepSeek Harness）
 へレビュー依頼を送り、結果を =*crit-magit-review*= バッファに表示できます。
-DSH は headless プロファイル（ワンショット実行）で起動されます。
+送信前に DSH の ACP プロファイルへ接続して利用可能なモデル一覧を取得し、
+選択した provider/model を headless プロファイル（ワンショット実行）へ渡します。
 
 - =M-x crit-magit-review= — 現在行／選択範囲／ファイルのレビュー対象を DSH へ送る（diff バッファ専用）
 - =M-x crit-magit-review-whole= — 全体を DSH へ送る（diff バッファはバッファ全体、status バッファはワーキングツリー全体の diff）
-- =M-x crit-magit-set-dsh-model= — DSH 側の AI モデルを選択肢から選んで設定する
+- =M-x crit-magit-set-dsh-model= — DSH ACP からモデル一覧を取得して選択する
 
 ** モデルの選択
 
-=crit-magit-dsh-models= が選択肢（ラベルと provider/model の組）を、
-=crit-magit-dsh-default-model= が既定モデルのラベルを保持します。
-=crit-magit-set-dsh-model= で対話的に変更できます。非既定モデルを選んだ
-場合のみ、実行時に一時的な =--patch= 上書きが生成され、DSH の既定モデル
-のままの場合は =--patch= を付与しません。
+=crit-magit-set-dsh-model= またはレビューコマンドを実行すると、DSH ACP の
+=session/new= 応答からモデル一覧を取得して選択できます。直前に選択した
+provider/model は、既定で =~/.emacs.d/crit-magit-dsh-model.json= に保存され、
+次回の補完候補の初期値になります。各レビュー時には一覧を再取得するため、
+DSH 側で追加・削除されたモデルも反映されます。
+
+従来の =crit-magit-dsh-models= と =crit-magit-dsh-default-model= は、ACP を
+使わないプログラム呼び出しや既定値比較のためのフォールバックとして残ります。
+選択した provider/model が DSH の既定値と異なる場合だけ、実行時に一時的な
+=--patch= 上書きファイルを生成します。
 
 ** 前提条件
 
-- =dsh= コマンドが =PATH= にあること
+- =dsh= コマンドが =PATH= にあること、または =crit-magit-dsh-command= で実行ファイルのパスを指定すること
+- DSH に =acp= プロファイルと =headless= プロファイルがあること
+- DSH を PATH に置かない場合の指定例（DSH checkout の場所に合わせて変更）
+
+  #+begin_src emacs-lisp
+  ;; use-package の :custom 内で、パスを実際の場所に変更する。
+  ;; (crit-magit-dsh-command
+  ;;    "/PATH/TO/DSH_DIR/apps/cli/lib/bin.js")
+  #+end_src
 - DSH の headless プロファイルと認証情報が設定済みであること
   （既定は =~/.dsh=、=DSH_HOME= で変更可。Web GUI で設定済みの認証情報が共用されます）
 
-* 注意
+* コメントと再レビュー
 
-DSH レビューコマンド（=crit-magit-review= / =crit-magit-review-whole= /
-=crit-magit-set-dsh-model=）は実装済みです。一方、=crit-magit-comment= や
-=crit-magit-comment-file= などのコメント書き込みコマンドは未実装です。
+コメントはリポジトリ root の =.critmagit/<session-id>.md= に保存されます。
+初回作成時に =.gitignore= へ =.critmagit/= を追加します。セッション ID が
+未設定の場合は明示的に入力します。
+
+- =M-x crit-magit-comment= — diff の現在行または region にコメント
+- =M-x crit-magit-comment-file= — diff の現在ファイル全体にコメント
+- =M-x crit-magit-review-session= — 保存済み未解決コメントを DSH に送る
+- =M-x crit-magit-open-session= — 現在のセッションファイルを開く
+- =M-x crit-magit-copy-session-file= — AI へ渡す指示文を kill-ring にコピー
+
+=crit-magit-review-after-comment= は既定で有効です。コメントを保存すると、
+ACP でモデルを選択した後、DSH が未解決コメントを読み、必要なソース変更と
+再レビューを行います。DSH はセッションファイル自体を編集せず、commit や
+push も実行しません。コメント本文とセッションファイルには、認証情報などの
+秘密情報を記録しないでください。
 
 * ライセンス
 

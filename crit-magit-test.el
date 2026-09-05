@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'crit-magit)
 
 ;;;; Approved-verifier selector compatibility
@@ -327,8 +328,8 @@
             (should (string-match-p "id: agent-default-model" content))
             (should (string-match-p
                      "@deepseek-ai/dsh-agent-default-model" content))
-            (should (string-match-p "provider: deepseek-official" content))
-            (should (string-match-p "model: deepseek-v4-pro" content))))
+             (should (string-match-p "provider: 'deepseek-official'" content))
+             (should (string-match-p "model: 'deepseek-v4-pro'" content))))
       (when (and file (file-exists-p file))
         (delete-file file)))))
 
@@ -436,14 +437,125 @@
   :tags '(crit-magit-dsh-command)
   (should (equal crit-magit-dsh-review-buffer-name "*crit-magit-review*")))
 
+(ert-deftest crit-magit-dsh-command-missing ()
+  "A missing DSH executable signals an actionable user error."
+  :tags '(crit-magit-dsh-command)
+  (let ((crit-magit-dsh-command "/definitely/missing/crit-magit-dsh"))
+    (should-error
+     (crit-magit--start-dsh "review me" "DeepSeek-V4-Flash"
+                             default-directory #'ignore)
+     :type 'user-error)))
+
 (ert-deftest crit-magit-dsh-command-set-model ()
   "Setting a known model updates the default; unknown models error."
   :tags '(crit-magit-dsh-command)
-  (let ((crit-magit-dsh-default-model "DeepSeek-V4-Flash"))
-    (crit-magit-set-dsh-model "DeepSeek-V4-Pro")
-    (should (equal crit-magit-dsh-default-model "DeepSeek-V4-Pro")))
-  (should-error (crit-magit-set-dsh-model "Not-A-Model")
-                :type 'user-error))
+  (let ((crit-magit-dsh-default-model "DeepSeek-V4-Flash")
+        (crit-magit-dsh-selected-model nil)
+        (crit-magit--dsh-model-loaded nil)
+        (crit-magit-dsh-model-history-file
+         (make-temp-file "crit-magit-model-test-")))
+    (unwind-protect
+        (progn
+          (crit-magit-set-dsh-model "DeepSeek-V4-Pro")
+          (should (equal crit-magit-dsh-default-model "DeepSeek-V4-Pro"))
+          (should (equal crit-magit-dsh-selected-model
+                         '("deepseek-official" . "deepseek-v4-pro")))
+          (should-error (crit-magit-set-dsh-model "Not-A-Model")
+                        :type 'user-error))
+      (when (file-exists-p crit-magit-dsh-model-history-file)
+        (delete-file crit-magit-dsh-model-history-file)))))
+
+(ert-deftest crit-magit-dsh-acp-model-options ()
+  "Parse grouped ACP model choices and the current selection."
+  :tags '(crit-magit-dsh-transport)
+  (let* ((options
+          (json-parse-string
+           "[{\"id\":\"model\",\"currentValue\":\"[\\\"deepseek-official\\\",\\\"deepseek-v4-flash\\\"]\",\"options\":[{\"group\":\"deepseek-official\",\"options\":[{\"name\":\"Flash\",\"value\":\"[\\\"deepseek-official\\\",\\\"deepseek-v4-flash\\\"]\"},{\"name\":\"Pro\",\"value\":\"[\\\"deepseek-official\\\",\\\"deepseek-v4-pro\\\"]\"}]}]}]"
+           :object-type 'alist :array-type 'list))
+         (choices (crit-magit--dsh-model-options options)))
+     (should (equal choices
+                    '(("deepseek-official / Flash"
+                       . ("deepseek-official" . "deepseek-v4-flash"))
+                      ("deepseek-official / Pro"
+                       . ("deepseek-official" . "deepseek-v4-pro")))))
+    (should (equal (crit-magit--dsh-model-current-selection options)
+                   '("deepseek-official" . "deepseek-v4-flash")))))
+
+(ert-deftest crit-magit-dsh-remembered-model-load ()
+  "Persist and reload the selected ACP model."
+  :tags '(crit-magit-dsh-transport)
+  (let ((history (make-temp-file "crit-magit-model-test-"))
+        (crit-magit-dsh-selected-model nil)
+        (crit-magit--dsh-model-loaded nil)
+        (crit-magit-dsh-model-history-file nil))
+    (unwind-protect
+        (progn
+          (setq crit-magit-dsh-model-history-file history)
+          (crit-magit--dsh-remember-model
+           '("provider" . "model"))
+          (setq crit-magit-dsh-selected-model nil
+                crit-magit--dsh-model-loaded nil)
+          (crit-magit--dsh-load-selected-model)
+          (should (equal crit-magit-dsh-selected-model
+                         '("provider" . "model"))))
+      (when (file-exists-p history)
+        (delete-file history)))))
+
+(ert-deftest crit-magit-dsh-remembered-model-is-default ()
+  "Offer the persisted ACP model as the next completion default."
+  :tags '(crit-magit-dsh-transport)
+  (let ((history (make-temp-file "crit-magit-model-test-"))
+        (crit-magit-dsh-selected-model nil)
+        (crit-magit--dsh-model-loaded nil)
+        (crit-magit-dsh-model-history-file nil)
+        (initial nil))
+    (unwind-protect
+        (progn
+          (setq crit-magit-dsh-model-history-file history)
+          (crit-magit--dsh-remember-model '("provider" . "model"))
+          (setq crit-magit-dsh-selected-model nil
+                crit-magit--dsh-model-loaded nil)
+          (let ((options
+                 (json-parse-string
+                  "[{\"id\":\"model\",\"currentValue\":\"[\\\"provider\\\",\\\"model\\\"]\",\"options\":[{\"name\":\"Model\",\"value\":\"[\\\"provider\\\",\\\"model\\\"]\"}]}]"
+                  :object-type 'alist :array-type 'list)))
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_prompt _collection _predicate _require-match
+                                default)
+                         (setq initial default)
+                         default))
+                      )
+              (should (equal (crit-magit--dsh-choose-model options)
+                             '("provider" . "model")))))
+          (should (equal initial "provider / Model")))
+      (when (file-exists-p history)
+        (delete-file history)))))
+
+(ert-deftest crit-magit-dsh-review-discovers-model-before-send ()
+  "Model discovery completes before a review process is started."
+  :tags '(crit-magit-dsh-command)
+  (let ((discovery-callback nil)
+        (chosen-options nil)
+        (started nil)
+        (crit-magit--dsh-process nil))
+    (cl-letf (((symbol-function 'crit-magit--start-acp-model-discovery)
+               (lambda (_root callback)
+                 (setq discovery-callback callback)))
+              ((symbol-function 'crit-magit--dsh-choose-model)
+               (lambda (options)
+                 (setq chosen-options options)
+                 '("provider" . "model")))
+              ((symbol-function 'crit-magit--start-dsh)
+               (lambda (prompt model root callback)
+                 (setq started (list prompt model root callback))))
+      (crit-magit--request-review "review prompt" "/tmp/repo")
+      (should discovery-callback)
+      (should-not started)
+      (funcall discovery-callback (cons 'success '(dummy-options)))
+      (should (equal chosen-options '(dummy-options)))
+      (should (equal (nth 0 started) "review prompt"))
+      (should (equal (nth 1 started) '("provider" . "model")))
+      (should (equal (nth 2 started) "/tmp/repo"))))))
 
 (ert-deftest crit-magit-dsh-command-show-review-success ()
   "A success outcome inserts the answer into the review buffer."
@@ -510,6 +622,87 @@
   (with-temp-buffer
     (setq major-mode 'magit-status-mode)
     (should-error (crit-magit-review) :type 'user-error)))
+
+;;;; Session comment tests
+
+(ert-deftest crit-magit-session-default-file-safe ()
+  "Build a session path below the repository and reject traversal."
+  :tags '(crit-magit-session)
+  (let ((root (make-temp-file "crit-magit-session-root-" t)))
+    (unwind-protect
+        (progn
+          (should (equal
+                   (crit-magit-default-session-file root "review-1")
+                   (expand-file-name ".critmagit/review-1.md" root)))
+          (dolist (invalid '("../outside" "a/b" "a\\b" "." ""))
+            (should-error (crit-magit-default-session-file root invalid)
+                          :type 'user-error)))
+      (delete-directory root t))))
+
+(ert-deftest crit-magit-session-write-comment ()
+  "Write two comments with stable anchors and one ignored session directory."
+  :tags '(crit-magit-session)
+  (let* ((root (make-temp-file "crit-magit-session-root-" t))
+         (crit-magit-session-id "review-1")
+         (crit-magit-author "tester")
+         (crit-magit-review-after-comment nil)
+         (target (list :repository root
+                       :path "src/auth.el"
+                       :start-line 21
+                       :end-line 22
+                       :side 'added
+                       :commit "HEAD"
+                       :base "main"
+                       :context "added line")))
+    (unwind-protect
+        (let* ((first (crit-magit--write-comment target "Fix this\ncarefully"))
+               (second (crit-magit--write-comment target "Re-check the branch"))
+               (file (plist-get first :file))
+               (content (crit-magit--read-file file))
+               (gitignore (crit-magit--read-file
+                           (expand-file-name ".gitignore" root))))
+          (should (file-exists-p file))
+          (should (equal (plist-get first :count) 1))
+          (should (equal (plist-get second :count) 2))
+          (should (string-match-p "# crit-magit session: review-1" content))
+          (should (string-match-p "- path: `src/auth.el`" content))
+          (should (string-match-p "- lines: 21-22" content))
+          (should (string-match-p "- side: added" content))
+          (should (string-match-p "- author: tester" content))
+          (should (string-match-p (concat "> Fix this" "\n> carefully")
+                                  content))
+          (should (string-match-p "Re-check the branch" content))
+          (should (equal gitignore ".critmagit/\n")))
+      (delete-directory root t))))
+
+(ert-deftest crit-magit-session-rejects-corrupt-file ()
+  "Do not append to a session file with a mismatched header."
+  :tags '(crit-magit-session)
+  (let* ((root (make-temp-file "crit-magit-session-root-" t))
+         (crit-magit-session-id "review-1")
+         (crit-magit-review-after-comment nil)
+         (target (list :repository root :path "a.el"
+                       :start-line 1 :end-line 1 :side 'added
+                       :commit "HEAD" :base "unknown" :context "a")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".critmagit" root))
+          (with-temp-file (expand-file-name ".critmagit/review-1.md" root)
+            (insert "# another session\n"))
+          (should-error (crit-magit--write-comment target "do not append")
+                        :type 'user-error))
+      (delete-directory root t))))
+
+(ert-deftest crit-magit-session-review-prompt ()
+  "Tell DSH where the session is and require a post-change re-review."
+  :tags '(crit-magit-session)
+  (let ((prompt (crit-magit--build-session-review-prompt
+                 "/tmp/repo" "/tmp/repo/.critmagit/review.md")))
+    (should (string-match-p "Repository root: /tmp/repo" prompt))
+    (should (string-match-p "Session file: /tmp/repo/.critmagit/review.md"
+                            prompt))
+    (should (string-match-p "resulting git diff" prompt))
+    (should (string-match-p "Do not commit or push" prompt))))
 
 (provide 'crit-magit-test)
 ;;; crit-magit-test.el ends here
