@@ -443,7 +443,7 @@ STATUS is `error' with STDERR (or STDOUT when STDERR is empty)."
                    stdout))))
 
 (defun crit-magit--dsh-sentinel (proc callback patch-file
-                                     stdout-buffer stderr-buffer)
+                                      stdout-buffer stderr-buffer)
   "Handle exit of DSH process PROC.
 Call CALLBACK with (STATUS . TEXT) from `crit-magit--dsh-outcome',
 then clean up the temporary patch file and output buffers."
