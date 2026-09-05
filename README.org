@@ -13,14 +13,17 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
   :after magit
   :bind (:map magit-diff-mode-map
               ("C-c c" . crit-magit-comment)
-              ("C-c f" . crit-magit-comment-file)))
+              ("C-c m f" . crit-magit-comment-file)))
 #+end_src
 
 これで =crit-magit= がインストールされ、Magit の diff バッファで次の
 ショートカットを使える設定になります。
 
 - =C-c c= — 現在行または選択範囲にコメント
-- =C-c f= — 現在のファイル全体にコメント
+- =C-c m f= — 現在のファイル全体にコメント
+
+=global-map= の =C-c= に続く =f= は =elfeed= に割り当てられているため、
+Magit 内では競合しない =C-c m f= を使います。
 
 初回起動時に =use-package= の VC サポートが利用できない場合は、まず
 次を評価してください。
@@ -33,6 +36,30 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
 #+begin_src emacs-lisp
 (require 'use-package)
 #+end_src
+
+* DSH AI レビュー
+
+Magit の diff バッファから、ローカルで稼働する DSH（DeepSeek Harness）
+へレビュー依頼を送り、結果を =*crit-magit-review*= バッファに表示できます。
+DSH は headless プロファイル（ワンショット実行）で起動されます。
+
+- =M-x crit-magit-review= — 現在行／選択範囲／ファイルのレビュー対象を DSH へ送る
+- =M-x crit-magit-review-whole= — 現在の diff バッファ全体を DSH へ送る
+- =M-x crit-magit-set-dsh-model= — DSH 側の AI モデルを選択肢から選んで設定する
+
+** モデルの選択
+
+=crit-magit-dsh-models= が選択肢（ラベルと provider/model の組）を、
+=crit-magit-dsh-default-model= が既定モデルのラベルを保持します。
+=crit-magit-set-dsh-model= で対話的に変更できます。非既定モデルを選んだ
+場合のみ、実行時に一時的な =--patch= 上書きが生成され、DSH の既定モデル
+のままの場合は =--patch= を付与しません。
+
+** 前提条件
+
+- =dsh= コマンドが =PATH= にあること
+- DSH の headless プロファイルと認証情報が設定済みであること
+  （既定は =~/.dsh=、=DSH_HOME= で変更可。Web GUI で設定済みの認証情報が共用されます）
 
 * 注意
 
