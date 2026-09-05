@@ -470,5 +470,46 @@
     (should-error (crit-magit-review) :type 'user-error)
     (should-error (crit-magit-review-whole) :type 'user-error)))
 
+;;;; Status buffer support tests
+
+(ert-deftest crit-magit-status-assert-review-buffer ()
+  "The review-buffer predicate accepts diff and status modes."
+  :tags '(crit-magit-status)
+  (with-temp-buffer
+    (setq major-mode 'magit-diff-mode)
+    (should (crit-magit--assert-review-buffer)))
+  (with-temp-buffer
+    (setq major-mode 'magit-status-mode)
+    (should (crit-magit--assert-review-buffer)))
+  (with-temp-buffer
+    (should-error (crit-magit--assert-review-buffer) :type 'user-error)))
+
+(ert-deftest crit-magit-status-working-tree-diff ()
+  "Return the staged+unstaged diff in a repository."
+  :tags '(crit-magit-status)
+  (let ((repo (make-temp-file "crit-magit-git-" t)))
+    (unwind-protect
+        (let ((default-directory repo))
+          (call-process "git" nil nil nil "init" "-q")
+          (call-process "git" nil nil nil "config" "user.email" "t@t")
+          (call-process "git" nil nil nil "config" "user.name" "t")
+          (with-temp-file (expand-file-name "a.txt" repo)
+            (insert "hello\n"))
+          (call-process "git" nil nil nil "add" "a.txt")
+          (call-process "git" nil nil nil "commit" "-q" "-m" "init")
+          (with-temp-file (expand-file-name "a.txt" repo)
+            (insert "hello world\n"))
+          (let ((diff (crit-magit--working-tree-diff repo)))
+            (should (stringp diff))
+            (should (string-match-p "hello world" diff))))
+      (delete-directory repo t))))
+
+(ert-deftest crit-magit-status-target-in-status ()
+  "Line-target review signals an error in a status buffer."
+  :tags '(crit-magit-status)
+  (with-temp-buffer
+    (setq major-mode 'magit-status-mode)
+    (should-error (crit-magit-review) :type 'user-error)))
+
 (provide 'crit-magit-test)
 ;;; crit-magit-test.el ends here
