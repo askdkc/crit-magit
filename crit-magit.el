@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 askdkc
 
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, vc
 
@@ -697,14 +697,14 @@ Create the session directory and header content when FILE is new."
      (t (make-directory directory t)))
     (when (file-symlink-p file)
       (user-error "Refusing to use symlink session file: %s" file))
-     (when (file-directory-p file)
-       (user-error "Session file is a directory: %s" file))
-     (if (file-exists-p file)
-         (let ((content (crit-magit--read-file file)))
-           (unless (crit-magit--session-header-p content session-id)
-             (user-error "Session file belongs to another session or is corrupt: %s"
-                         file))
-           (cons file content))
+    (when (file-directory-p file)
+      (user-error "Session file is a directory: %s" file))
+    (if (file-exists-p file)
+        (let ((content (crit-magit--read-file file)))
+          (unless (crit-magit--session-header-p content session-id)
+            (user-error "Session file belongs to another session or is corrupt: %s"
+                        file))
+          (cons file content))
       (cons file
             (format
              "# crit-magit session: %s\n\n- protocol: 1\n- repository: `%s`\n- created: %s\n\n"
@@ -863,8 +863,8 @@ Only the standard select option whose id is `model' is accepted."
       (dolist (entry (crit-magit--json-object-value model-option "options"))
         (let* ((group (crit-magit--json-object-value entry "group"))
                (values (if (stringp group)
-                            (crit-magit--json-object-value entry "options")
-                          (list entry))))
+                           (crit-magit--json-object-value entry "options")
+                         (list entry))))
           (dolist (value values)
             (let* ((selection
                     (crit-magit--dsh-selection-from-value
@@ -899,9 +899,9 @@ Only the standard select option whose id is `model' is accepted."
           (let* ((data (json-parse-string
                         (crit-magit--read-file crit-magit-dsh-model-history-file)
                         :object-type 'alist))
-                  (selection
-                   (cons (crit-magit--json-object-value data "provider")
-                         (crit-magit--json-object-value data "model"))))
+                 (selection
+                  (cons (crit-magit--json-object-value data "provider")
+                        (crit-magit--json-object-value data "model"))))
             (when (crit-magit--valid-model-selection-p selection)
               (setq crit-magit-dsh-selected-model selection)))
         (error nil)))))
@@ -1046,13 +1046,13 @@ Only the standard select option whose id is `model' is accepted."
            (if (not (equal id (plist-get state :expected-id)))
                (crit-magit--acp-failure
                 process state callback "Unexpected DSH ACP session response")
-              (let* ((result (crit-magit--json-object-value message "result"))
-                     (session-id (and (listp result)
-                                      (crit-magit--json-object-value
-                                       result "sessionId")))
-                     (options (and (listp result)
-                                   (crit-magit--json-object-value
-                                    result "configOptions"))))
+             (let* ((result (crit-magit--json-object-value message "result"))
+                    (session-id (and (listp result)
+                                     (crit-magit--json-object-value
+                                      result "sessionId")))
+                    (options (and (listp result)
+                                  (crit-magit--json-object-value
+                                   result "configOptions"))))
                (if (not (and (stringp session-id) (listp options)))
                    (crit-magit--acp-failure
                     process state callback
@@ -1218,7 +1218,7 @@ STATUS is `error' with STDERR (or STDOUT when STDERR is empty)."
                    stdout))))
 
 (defun crit-magit--dsh-sentinel (proc callback patch-file
-                                       stdout-buffer stderr-buffer)
+                                      stdout-buffer stderr-buffer)
   "Handle exit of DSH process PROC.
 Call CALLBACK with (STATUS . TEXT) from `crit-magit--dsh-outcome',
 then clean up the temporary patch file and output buffers."
@@ -1250,9 +1250,9 @@ called with (STATUS . TEXT) when the process exits."
   (let* ((argv-and-patch (crit-magit--dsh-argv prompt model))
          (argv (car argv-and-patch))
          (patch-file (cdr argv-and-patch))
-          (stdout-buffer (generate-new-buffer " *crit-magit-dsh-stdout*"))
-          (stderr-buffer (generate-new-buffer " *crit-magit-dsh-stderr*"))
-          (default-directory (expand-file-name root)))
+         (stdout-buffer (generate-new-buffer " *crit-magit-dsh-stdout*"))
+         (stderr-buffer (generate-new-buffer " *crit-magit-dsh-stderr*"))
+         (default-directory (expand-file-name root)))
     (condition-case error-data
         (let ((process
                (make-process
@@ -1322,7 +1322,7 @@ yield no content."
          "The working directory is the repository root.\n"
          "Review only; do not modify files, commit, or push.\n\n"
          (crit-magit--review-content-block whole-content))
-       (user-error "No review target or diff content"))))
+      (user-error "No review target or diff content"))))
 
 (defun crit-magit--build-session-review-prompt (root session-file &optional content diff)
   "Build a DSH prompt to process unresolved comments in SESSION-FILE.
@@ -1594,7 +1594,7 @@ one.  The last selection is offered first next time."
                    (crit-magit--extract-diff-target)))
          (prompt (crit-magit--build-review-prompt
                   target (crit-magit--buffer-diff))))
-     (crit-magit--request-review prompt root)))
+    (crit-magit--request-review prompt root)))
 
 (defun crit-magit-review-whole ()
   "Send the whole current diff for DSH AI review.
@@ -1610,7 +1610,7 @@ status buffer the working-tree diff (staged and unstaged) is
                     (crit-magit--buffer-diff)))
          (prompt (concat (crit-magit--build-review-prompt nil content)
                          (crit-magit--current-session-context root))))
-     (crit-magit--request-review prompt root)))
+    (crit-magit--request-review prompt root)))
 
 (provide 'crit-magit)
 ;;; crit-magit.el ends here
