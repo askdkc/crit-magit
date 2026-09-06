@@ -36,7 +36,8 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
 
 - =C-c r= — diff バッファでは現在行／選択範囲／ファイル、status バッファでは全体を DSH へレビュー依頼
 - =C-c w r= — diff バッファ全体を DSH へレビュー依頼
-- =C-c c= — 現在行または選択範囲へレビューコメントを追加
+- =C-c c= — 現在行または選択範囲へレビューコメントを追加（セッション ID
+  が未設定なら聞かれ、=RET= でランダム ID を使用）
 - =C-c f= — 現在ファイル全体へレビューコメントを追加
 - =C-c s= — 現在セッションの未解決コメントを DSH へ送る
 - =C-c m= — ACP から DSH モデル一覧を取得して選択
@@ -114,15 +115,40 @@ DSH headless 側の設定が異なっていても、選択したモデルを渡�
 
 * コメントと再レビュー
 
+** セッション ID
+
 コメントはリポジトリ root の =.critmagit/<session-id>.md= に保存されます。
-初回作成時に =.gitignore= へ =.critmagit/= を追加します。セッション ID が
-未設定の場合は明示的に入力します。
+=session-id= の部分がセッション ID で、レビューコメントのまとまりを識別する
+自由な名前です（例: =review-login=）。ファイル名として安全な単一の要素で
+あれば何でも構いません。
+
+=crit-magit-session-id= が未設定のまま =C-c c= などのコメント操作をすると、
+=minibuffer= で =crit-magit session ID:= と聞かれます。これは追記先の
+ファイル名を確定するためです。そのまま =RET= を押すと、タイムスタンプに
+基づくランダム ID（例: =session-20260906-143000=）を初期値として新規
+セッションを開始します。入力した値はその Emacs セッションの間記憶され、
+以後は聞かれません。
+
+聞かれたくない場合は、先に =M-x crit-magit-set-session= で設定するか、init
+ファイルで固定値を設定してください。
+
+#+begin_src emacs-lisp
+(setq crit-magit-session-id "review-login")
+#+end_src
+
+ランダム ID の形式は =crit-magit-default-session-id= で、変更する場合は
+=crit-magit-session-id-function= に文字列を返す関数を設定してください。
+
+** コメントの保存と再レビュー
+
+初回作成時に =.gitignore= へ =.critmagit/= を追加します。
 
 - =M-x crit-magit-comment= — diff の現在行または region にコメント
 - =M-x crit-magit-comment-file= — diff の現在ファイル全体にコメント
 - =M-x crit-magit-review-session= — 保存済み未解決コメントを DSH に送る
 - =M-x crit-magit-open-session= — 現在のセッションファイルを開く
 - =M-x crit-magit-copy-session-file= — AI へ渡す指示文を kill-ring にコピー
+- =M-x crit-magit-set-session= — 現在のセッション ID を設定・変更する
 
 =crit-magit-review-after-comment= は既定で有効です。コメントを保存すると、
 ACP でモデルを選択した後、DSH が未解決コメントを読み、必要なソース変更と

@@ -577,21 +577,41 @@ The result is always below ROOT's configured session directory."
       (user-error "Session file leaves the session directory: %s" file))
     file))
 
+(defcustom crit-magit-session-id-function 'crit-magit-default-session-id
+  "Function returning a default session ID for the prompt.
+Called with no arguments and must return a string or nil.  The
+default returns a timestamp-based random ID, so pressing RET at
+the prompt starts a fresh session instead of erroring."
+  :type 'function
+  :group 'crit-magit)
+
+(defun crit-magit-default-session-id ()
+  "Return a timestamp-based default session ID.
+The result is a safe single path component suitable for
+`crit-magit-default-session-file'."
+  (format "session-%s"
+          (format-time-string "%Y%m%d-%H%M%S" nil t)))
+
 (defun crit-magit--session-id ()
   "Return the configured session ID, prompting when it is unset.
 The explicitly selected ID is retained for subsequent commands in this
-Emacs session."
+Emacs session.  When prompted, RET accepts the default from
+`crit-magit-session-id-function'."
   (let ((id (or crit-magit-session-id
-                (read-string "crit-magit session ID: "))))
+                (read-string "crit-magit session ID: "
+                             (funcall crit-magit-session-id-function)))))
     (setq id (crit-magit--validate-session-id id))
     (setq crit-magit-session-id id)
     id))
 
 (defun crit-magit-set-session (session-id)
   "Set the current AI review SESSION-ID.
-Interactively, prompt for a safe single-component session name."
+Interactively, prompt for a safe single-component session name; RET
+accepts the default from `crit-magit-session-id-function'."
   (interactive
-   (list (read-string "crit-magit session ID: " crit-magit-session-id)))
+   (list (read-string "crit-magit session ID: "
+                      (or crit-magit-session-id
+                          (funcall crit-magit-session-id-function)))))
   (setq crit-magit-session-id (crit-magit--validate-session-id session-id))
   (message "crit-magit: session set to %s" crit-magit-session-id))
 
