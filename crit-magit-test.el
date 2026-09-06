@@ -64,7 +64,9 @@
   (should (eq crit-magit-auto-update-gitignore t))
   (should (equal crit-magit-author "user"))
   (should (eq crit-magit-session-file-function
-              'crit-magit-default-session-file)))
+              'crit-magit-default-session-file))
+  (should (eq crit-magit-review-after-comment nil))
+  (should (equal crit-magit-progress-buffer-name "*crit-magit-progress*")))
 
 ;;;; Position extraction tests
 
@@ -395,6 +397,9 @@
     (let ((prompt (crit-magit--build-review-prompt target)))
       (should (stringp prompt))
       (should (not (string-empty-p prompt)))
+      (should (string-match-p "review only" prompt))
+      (should (string-match-p "must not change" prompt))
+      (should (string-match-p "REVIEW comment" prompt))
       (should (string-match-p "File: src/auth.el" prompt))
       (should (string-match-p "lines 21-22" prompt))
       (should (string-match-p "Side: added" prompt))
@@ -698,8 +703,98 @@
                         :type 'user-error))
       (delete-directory root t))))
 
+(ert-deftest crit-magit-progress-log-appends-timestamped-lines ()
+  "Progress log appends to the progress buffer and scrolls its window."
+  :tags '(crit-magit-progress)
+  (let ((crit-magit-progress-buffer-name " *crit-magit-progress-test*"))
+    (unwind-protect
+        (progn
+          (crit-magit--progress-log "first %s" "event")
+          (crit-magit--progress-log "second event")
+          (with-current-buffer (get-buffer crit-magit-progress-buffer-name)
+            (should (string-match-p "\\[..:..:..\\] first event\n" (buffer-string)))
+            (should (string-match-p "\\[..:..:..\\] second event\n" (buffer-string)))
+            (should (= (point) (point-max)))))
+      (when (get-buffer crit-magit-progress-buffer-name)
+        (kill-buffer crit-magit-progress-buffer-name)))))
+
+(ert-deftest crit-magit-progress-open-resets-buffer ()
+  "Opening the progress buffer resets and displays it as special-mode."
+  :tags '(crit-magit-progress)
+  (let ((crit-magit-progress-buffer-name " *crit-magit-progress-test*"))
+    (unwind-protect
+        (progn
+          (crit-magit--progress-open)
+          (with-current-buffer crit-magit-progress-buffer-name
+            (should (derived-mode-p 'special-mode))
+            (should (string-match-p "crit-magit DSH progress" (buffer-string))))
+          (crit-magit--progress-log "running")
+          (with-current-buffer crit-magit-progress-buffer-name
+            (should (string-match-p "running" (buffer-string)))))
+      (when (get-buffer crit-magit-progress-buffer-name)
+        (kill-buffer crit-magit-progress-buffer-name)))))
+
+(ert-deftest crit-magit-dsh-stdout-filter-streams-chunks ()
+  "DSH stdout chunks stream into the progress and stdout buffers."
+  :tags '(crit-magit-progress)
+  (let ((crit-magit-progress-buffer-name " *crit-magit-progress-test*")
+        (stdout (generate-new-buffer " *crit-magit-dsh-stdout-test*")))
+    (unwind-protect
+        (progn
+          (crit-magit--dsh-stdout-filter nil "part1\r\npart2\n" stdout)
+          (with-current-buffer stdout
+            (should (equal (buffer-string) "part1\r\npart2\n")))
+          (with-current-buffer crit-magit-progress-buffer-name
+            (should (string-match-p "part1" (buffer-string)))
+            (should (string-match-p "part2" (buffer-string)))))
+      (when (get-buffer crit-magit-progress-buffer-name)
+        (kill-buffer crit-magit-progress-buffer-name))
+      (when (buffer-live-p stdout) (kill-buffer stdout)))))
+
+(ert-deftest crit-magit-send-session-sends-unresolved-comments ()
+  "The confirm command requires a review buffer and dispatches the session."
+  :tags '(crit-magit-session)
+  (let ((sent nil)
+        (file (make-temp-file "crit-magit-send-session-" )))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "# crit-magit session: s\n- status: unresolved\n"))
+          (with-temp-buffer
+            (setq major-mode 'magit-diff-mode)
+            (cl-letf (((symbol-function 'crit-magit--repository-root)
+                       (lambda () (file-name-directory file)))
+                      ((symbol-function 'crit-magit--session-id) (lambda () "s"))
+                      ((symbol-function 'crit-magit--session-file)
+                       (lambda (_root _id) file))
+                      ((symbol-function 'crit-magit--request-review)
+                       (lambda (prompt _root) (setq sent prompt))))
+              (crit-magit-send-session)
+              (should sent)
+              (should (string-match-p "review only" sent))))
+          (with-temp-buffer
+            (should-error (crit-magit-send-session) :type 'user-error)))
+      (when (file-exists-p file) (delete-file file)))))
+
+(ert-deftest crit-magit-comment-no-auto-review-by-default ()
+  "Saving a comment never dispatches DSH when review-after-comment is nil."
+  :tags '(crit-magit-session)
+  (let* ((repo (make-temp-file "crit-magit-accumulate-" t))
+         (crit-magit-session-id "accumulate")
+         (crit-magit-review-after-comment nil))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "keep local"))
+                    ((symbol-function 'crit-magit--review-session-file)
+                     (lambda (&rest _) (ert-fail "Must not dispatch by default"))))
+            (crit-magit--comment-target (list :repository repo :path "a" :side 'file)))
+          (should (string-match-p "keep local"
+                                  (crit-magit--read-file
+                                   (crit-magit--session-file repo "accumulate")))))
+      (delete-directory repo t))))
+
 (ert-deftest crit-magit-session-review-prompt ()
-  "Tell DSH where the session is and require a post-change re-review."
+  "Tell DSH where the session is and require review-only REVIEW comments."
   :tags '(crit-magit-session)
   (let ((prompt (crit-magit--build-session-review-prompt
                  "/tmp/repo" "/tmp/repo/.critmagit/review.md"
@@ -707,7 +802,9 @@
     (should (string-match-p "Repository root: /tmp/repo" prompt))
     (should (string-match-p "Session file: /tmp/repo/.critmagit/review.md"
                             prompt))
-    (should (string-match-p "resulting git diff" prompt))
+    (should (string-match-p "review only" prompt))
+    (should (string-match-p "must not change" prompt))
+    (should (string-match-p "Do not apply any source changes" prompt))
     (should (string-match-p "Do not commit or push" prompt))))
 
 (provide 'crit-magit-test)

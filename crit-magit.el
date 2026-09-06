@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 askdkc
 
-;; Version: 0.1.2
+;; Version: 0.1.3
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, vc
 
@@ -31,10 +31,14 @@
 ;;
 ;;     <repository-root>/.critmagit/<session-id>.md
 ;;
-;; The configured DSH command reads that file to receive the comments and
-;; performs the source-change and re-review pass.  The session directory is
-;; added to the repository `.gitignore' once so that transient review state
-;; never enters Git history.
+;; Comments accumulate in the session file until you confirm the
+;; session with `crit-magit-send-session' (C-c C-s), which sends all
+;; unresolved comments to DSH.  The configured DSH command reads that
+;; file, produces review-only output (no source changes), and the
+;; result is shown in the review buffer while live progress streams
+;; into `crit-magit-progress-buffer-name'.  The session directory is
+;; added to the repository `.gitignore' once so that transient review
+;; state never enters Git history.
 ;;
 ;; The package starts only the configured local DSH command and does not call
 ;; vendor APIs, post to GitHub, or modify existing Magit or Forge behavior.
@@ -161,11 +165,18 @@ The file is removed after completion, failure, or cancellation."
   :type 'integer
   :group 'crit-magit)
 
-(defcustom crit-magit-review-after-comment t
+(defcustom crit-magit-review-after-comment nil
   "Whether `crit-magit-comment' should start a DSH re-review.
-When nil, the comment is only written to the session file and can be
-sent later with `crit-magit-review-session'."
+When non-nil, every saved comment immediately starts a DSH request.
+When nil (the default), comments accumulate in the session file until
+you confirm them with \\[crit-magit-send-session] or
+`crit-magit-review-session'."
   :type 'boolean
+  :group 'crit-magit)
+
+(defcustom crit-magit-progress-buffer-name "*crit-magit-progress*"
+  "Name of the buffer showing live DSH review progress."
+  :type 'string
   :group 'crit-magit)
 
 (defvar crit-magit--dsh-process nil
@@ -183,6 +194,9 @@ sent later with `crit-magit-review-session'."
 (defvar crit-magit--dsh-mode-line-entry
   '(" " (:eval (crit-magit--dsh-mode-line)))
   "Mode-line entry installed while a DSH review is running.")
+
+(defvar crit-magit--dsh-start-time nil
+  "Time when the active DSH request started, or nil.")
 
 ;; Magit is a runtime dependency only; never require it at load time.
 (declare-function magit-toplevel "magit" (&optional directory))
@@ -207,6 +221,9 @@ sent later with `crit-magit-review-session'."
 
 ;;;; DSH status
 
+(defvar crit-magit--progress-timer nil
+  "Timer refreshing the mode-line elapsed seconds while DSH runs.")
+
 (defun crit-magit--dsh-mode-line ()
   "Return a mode-line indicator while a DSH review is running."
   (when (and crit-magit--dsh-process
@@ -214,8 +231,51 @@ sent later with `crit-magit-review-session'."
     (propertize
      (if (eq crit-magit--dsh-stage 'model-discovery)
          "crit: discovering DSH models"
-       "crit: DSH review running")
+       (format "crit: DSH %s (%ds, C-c C-k to cancel)"
+               crit-magit--dsh-stage
+               (round (float-time
+                       (time-subtract (current-time)
+                                      crit-magit--dsh-start-time)))))
      'face 'mode-line-emphasis)))
+
+(defun crit-magit--progress-log (format-string &rest args)
+  "Append a timestamped line from FORMAT-STRING and ARGS to the progress buffer."
+  (let ((buffer (get-buffer-create crit-magit-progress-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format-time-string "[%H:%M:%S] ")
+                (apply #'format format-string args)
+                "\n"))
+      (let ((window (get-buffer-window buffer)))
+        (when window
+          (with-selected-window window
+            (goto-char (point-max))))))))
+
+(defun crit-magit--progress-open ()
+  "Create, reset, and display the progress buffer."
+  (let ((buffer (get-buffer-create crit-magit-progress-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "crit-magit DSH progress\n\n"))
+      (special-mode))
+    (display-buffer buffer)))
+
+(defun crit-magit--progress-start-timer ()
+  "Start the mode-line refresh timer for elapsed seconds."
+  (setq crit-magit--dsh-start-time (current-time))
+  (when crit-magit--progress-timer
+    (cancel-timer crit-magit--progress-timer))
+  (setq crit-magit--progress-timer
+        (run-at-time 1 1 #'force-mode-line-update t)))
+
+(defun crit-magit--progress-stop-timer ()
+  "Stop the mode-line refresh timer."
+  (when crit-magit--progress-timer
+    (cancel-timer crit-magit--progress-timer)
+    (setq crit-magit--progress-timer nil))
+  (setq crit-magit--dsh-start-time nil))
 
 (defun crit-magit--set-dsh-process (process &optional stage)
   "Set the active DSH PROCESS and install its mode-line indicator.
@@ -227,6 +287,7 @@ STAGE identifies the visible operation status."
   (unless (listp global-mode-string)
     (setq global-mode-string (list global-mode-string)))
   (add-to-list 'global-mode-string crit-magit--dsh-mode-line-entry t)
+  (crit-magit--progress-start-timer)
   (force-mode-line-update t))
 
 (defun crit-magit--clear-dsh-process (process)
@@ -237,6 +298,7 @@ STAGE identifies the visible operation status."
     (when (boundp 'global-mode-string)
       (setq global-mode-string
             (delete crit-magit--dsh-mode-line-entry global-mode-string)))
+    (crit-magit--progress-stop-timer)
     (force-mode-line-update t)))
 
 ;;;; Position extraction
@@ -1054,6 +1116,7 @@ Only the standard select option whose id is `model' is accepted."
                 process state callback "Unexpected DSH ACP initialize response")
              (setf (plist-get state :phase) 'new-session
                    (plist-get state :expected-id) 2)
+             (crit-magit--acp-log-phase 'new-session)
              (condition-case error-data
                  (crit-magit--acp-send
                   process 2 "session/new"
@@ -1081,6 +1144,7 @@ Only the standard select option whose id is `model' is accepted."
                        (plist-get state :expected-id) 3
                        (plist-get state :session-id) session-id
                        (plist-get state :options) options)
+                 (crit-magit--acp-log-phase 'close-session)
                  (condition-case error-data
                      (crit-magit--acp-send
                       process 3 "session/close"
@@ -1126,6 +1190,16 @@ Only the standard select option whose id is `model' is accepted."
     (crit-magit--acp-failure
      process state callback
      "DSH ACP server stopped before returning model choices")))
+
+(defun crit-magit--acp-log-phase (phase)
+  "Log a human-readable line for ACP discovery PHASE to the progress buffer."
+  (crit-magit--progress-log
+   "ACP %s..."
+   (pcase phase
+     ('initialize "initialize: starting DSH ACP server")
+     ('new-session "session/new: fetching model list")
+     ('close-session "session/close: closing discovery session")
+     (_ (symbol-name phase)))))
 
 (defun crit-magit--start-acp-model-discovery (root callback)
   "Start ACP model discovery for ROOT and call CALLBACK with its outcome."
@@ -1252,12 +1326,28 @@ then clean up the temporary patch file and output buffers."
               (stderr (if (buffer-live-p stderr-buffer)
                           (with-current-buffer stderr-buffer (buffer-string)) "")))
           (crit-magit--clear-dsh-process proc)
+          (crit-magit--progress-log
+           "DSH exited with status %s%s" exit-status
+           (if (and (integerp exit-status) (zerop exit-status))
+               ""
+             (format " (stderr: %s)"
+                     (string-trim (or stderr "(empty)")))))
           (funcall callback (crit-magit--dsh-outcome
                              exit-status stdout stderr)))
       (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
       (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))
       (when (and patch-file (file-exists-p patch-file))
         (delete-file patch-file)))))
+
+(defun crit-magit--dsh-stdout-filter (_proc chunk stdout-buffer)
+  "Stream DSH stdout CHUNK into the progress buffer.
+The full output is also accumulated in STDOUT-BUFFER for the final review."
+  (when (buffer-live-p stdout-buffer)
+    (with-current-buffer stdout-buffer
+      (goto-char (point-max))
+      (insert chunk)))
+  (crit-magit--progress-log
+   "%s" (string-trim-right (string-replace "\r" "\n" chunk))))
 
 (defun crit-magit--start-dsh (prompt model root callback)
   "Start a DSH one-shot review process and return it.
@@ -1273,6 +1363,8 @@ called with (STATUS . TEXT) when the process exits."
          (stdout-buffer (generate-new-buffer " *crit-magit-dsh-stdout*"))
          (stderr-buffer (generate-new-buffer " *crit-magit-dsh-stderr*"))
          (default-directory (expand-file-name root)))
+    (crit-magit--progress-log "Starting DSH headless review: %s"
+                              (mapconcat #'identity argv " "))
     (condition-case error-data
         (let ((process
                (make-process
@@ -1283,6 +1375,9 @@ called with (STATUS . TEXT) when the process exits."
                 :coding 'utf-8-unix
                 :noquery t
                 :connection-type 'pipe
+                :filter (lambda (proc chunk)
+                          (crit-magit--dsh-stdout-filter
+                           proc chunk stdout-buffer))
                 :sentinel (lambda (proc _event)
                             (crit-magit--dsh-sentinel
                              proc callback patch-file
@@ -1309,6 +1404,13 @@ called with (STATUS . TEXT) when the process exits."
   "Return CONTENT intact as review evidence."
   (concat "BEGIN CAPTURED DIFF\n" content "\nEND CAPTURED DIFF\n"))
 
+(defconst crit-magit--review-only-instruction
+  "This is review only. You must not change, create, or delete any files. \
+Do not run commands that modify the repository. You must produce a REVIEW \
+comment for each finding, written so that another AI agent could act on it \
+without further context."
+  "Hard review-only instruction embedded in every DSH review prompt.")
+
 (defun crit-magit--build-review-prompt (target &optional whole-content)
   "Build a complete review prompt for TARGET or WHOLE-CONTENT.
 TARGET is a review-target plist from `crit-magit--extract-diff-target'
@@ -1326,9 +1428,8 @@ yield no content."
                           ((= start end) (format "line %s" start))
                           (t (format "lines %s-%s" start end)))))
         (concat
-         "You are reviewing code changes in a Git repository. "
-         "The working directory is the repository root.\n"
-         "Review only; do not modify files, commit, or push.\n\n"
+         crit-magit--review-only-instruction "\n"
+         "The working directory is the repository root.\n\n"
          (format "File: %s\n" path)
          (format "Location: %s\n" lines)
          (format "Side: %s\n" side)
@@ -1338,9 +1439,8 @@ yield no content."
           (or whole-content (plist-get target :context) ""))))
     (if (and whole-content (not (string-empty-p whole-content)))
         (concat
-         "You are reviewing all changes in the current diff. "
-         "The working directory is the repository root.\n"
-         "Review only; do not modify files, commit, or push.\n\n"
+         crit-magit--review-only-instruction "\n"
+         "The working directory is the repository root.\n\n"
          (crit-magit--review-content-block whole-content))
       (user-error "No review target or diff content"))))
 
@@ -1349,16 +1449,16 @@ yield no content."
 ROOT is the repository working directory; CONTENT and DIFF are snapshots."
   (format
    (concat
-    "You are addressing source-review comments in a Git repository.\n\n"
+    "%s\n\n"
     "Repository root: %s\n"
     "Session file: %s\n\n"
-    "Process every unresolved comment in the captured session below. "
-    "For each comment, inspect the current source and diff, make the requested "
-    "source changes when appropriate, and do not edit the session file itself. "
-    "After applying changes, review the resulting git diff again and run the "
-    "relevant tests or checks. Report each comment ID, the action taken, tests "
-    "run, and any remaining concern. Do not commit or push changes.\n\n"
+    "For every unresolved comment in the captured session below: inspect the "
+    "current source and diff, state whether the concern is valid, and write a "
+    "REVIEW comment telling another AI agent exactly what to change and why. "
+    "Do not edit the session file itself. Do not apply any source changes "
+    "yourself. Do not commit or push changes.\n\n"
     "BEGIN CAPTURED SESSION\n%s\nEND CAPTURED SESSION\n\n%s")
+   crit-magit--review-only-instruction
    (expand-file-name root)
    (expand-file-name session-file)
    (or content (crit-magit--read-file session-file))
@@ -1434,6 +1534,8 @@ Use a private UTF-8 request file when command-line transport is too large."
   "Discover a model, send PROMPT under ROOT, and call CLEANUP when finished."
   (when (crit-magit--dsh-running-p)
     (user-error "A DSH review is already running"))
+  (crit-magit--progress-open)
+  (crit-magit--progress-log "Review requested; discovering models through DSH ACP...")
   (message "crit-magit: discovering models through DSH ACP...")
   (condition-case error-data
       (crit-magit--start-acp-model-discovery
@@ -1441,15 +1543,18 @@ Use a private UTF-8 request file when command-line transport is too large."
        (lambda (outcome)
          (if (eq (car outcome) 'success)
              (condition-case selection-error
-                 (let ((selection
-                        (crit-magit--dsh-choose-model (cdr outcome))))
+		 (let ((selection
+			(crit-magit--dsh-choose-model (cdr outcome))))
+                   (crit-magit--progress-log
+                    "Model selected: %s; requesting review..."
+                    (crit-magit--dsh-selection-label selection))
                    (message "crit-magit: requesting review (%s)..."
                             (crit-magit--dsh-selection-label selection))
                    (crit-magit--start-dsh
                     prompt selection root
                     (lambda (result)
                       (unwind-protect (crit-magit--show-review result)
-                        (funcall cleanup)))))
+			(funcall cleanup)))))
                (quit
                 (funcall cleanup)
                 (message "crit-magit: model selection canceled"))
@@ -1497,8 +1602,9 @@ SESSION-ID is used to validate the session header before dispatch."
 
 (defun crit-magit--comment-target (target)
   "Prompt for and save a comment attached to TARGET.
-When `crit-magit-review-after-comment' is non-nil, start a DSH re-review
-after the comment has been durably written."
+When `crit-magit-review-after-comment' is non-nil, start a DSH review
+after the comment has been durably written; otherwise the comment only
+accumulates in the session file."
   (let* ((root (plist-get target :repository))
          (path (plist-get target :path))
          (body (read-string (format "Comment on %s: " path)))
@@ -1519,8 +1625,10 @@ after the comment has been durably written."
 
 (defun crit-magit-comment ()
   "Attach a review comment to the current diff line or active region.
-The comment is stored in the current session and, by default, sent to DSH
-for a source-change and re-review pass."
+The comment is stored in the current session.  It is not sent to DSH
+until you confirm the session with \\[crit-magit-send-session] (or set
+`crit-magit-review-after-comment' non-nil to send every comment
+immediately)."
   (interactive)
   (crit-magit--comment-target (crit-magit--extract-diff-target)))
 
@@ -1528,6 +1636,12 @@ for a source-change and re-review pass."
   "Attach a review comment to the file at point in the current diff."
   (interactive)
   (crit-magit--comment-target (crit-magit--extract-file-target)))
+
+(defun crit-magit-send-session ()
+  "Confirm the current session and send its unresolved comments to DSH."
+  (interactive)
+  (crit-magit--assert-review-buffer)
+  (crit-magit-review-session))
 
 (defun crit-magit-open-session ()
   "Open the current repository's crit-magit session file."

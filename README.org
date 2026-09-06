@@ -21,13 +21,17 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
              ("C-c w r" . crit-magit-review-whole)
              ("C-c c" . crit-magit-comment)
              ("C-c f" . crit-magit-comment-file)
+             ("C-c C-s" . crit-magit-send-session)
              ("C-c s" . crit-magit-review-session)
+             ("C-c C-k" . crit-magit-cancel-review)
              ("C-c m" . crit-magit-set-dsh-model))
           (:map magit-status-mode-map
              ("C-c r" . crit-magit-review-whole)
              ("C-c c" . crit-magit-comment)
              ("C-c f" . crit-magit-comment-file)
+             ("C-c C-s" . crit-magit-send-session)
              ("C-c s" . crit-magit-review-session)
+             ("C-c C-k" . crit-magit-cancel-review)
              ("C-c m" . crit-magit-set-dsh-model)))
 #+end_src
 
@@ -36,10 +40,11 @@ Emacs 30.1 以降の =use-package= と =:vc= を使って、GitHub から直接
 
 - =C-c r= — diff バッファでは現在行／選択範囲／ファイル、status バッファでは全体を DSH へレビュー依頼
 - =C-c w r= — diff バッファ全体を DSH へレビュー依頼
-- =C-c c= — 現在行または選択範囲へレビューコメントを追加（セッション ID
-  が未設定なら聞かれ、=RET= でランダム ID を使用）
+- =C-c c= — 現在行または選択範囲へレビューコメントを追加。コメントはセッションに蓄積されるだけで、この時点では DSH へ送らない（セッション ID が未設定なら聞かれ、=RET= でランダム ID を使用）
 - =C-c f= — 現在ファイル全体へレビューコメントを追加
-- =C-c s= — 現在セッションの未解決コメントを DSH へ送る
+- =C-c C-s= — 蓄積した未解決コメントを確定して DSH へまとめて送る
+- =C-c s= — 確認なしで現在セッションの未解決コメントを DSH へ送る
+- =C-c C-k= — 実行中の DSH 依頼を中止する
 - =C-c m= — ACP から DSH モデル一覧を取得して選択
 
 初回起動時に =use-package= の VC サポートが利用できない場合は、まず
@@ -77,8 +82,9 @@ Magit の diff バッファから、ローカルで稼働する DSH（DeepSeek H
 読める必要があります。完了・失敗・キャンセル時に一時ファイルを削除します。
 全体レビューと対象レビューはレビュー専用で、ソースを変更しないよう指示します。
 
-=crit-magit-cancel-review= で実行中の依頼を中止できます。モデル一覧取得は
-既定で30秒でタイムアウトし、=crit-magit-dsh-discovery-timeout= で変更できます。
+=crit-magit-cancel-review=（=C-c C-k=）で実行中の依頼を中止できます。
+モデル一覧取得は既定で30秒でタイムアウトし、=crit-magit-dsh-discovery-timeout=
+で変更できます。
 
 ACP は標準入出力による接続です。crit-magit が依頼ごとに DSH を起動するため、
 別ターミナルで =pnpm dsh --profile acp= を常駐させておく必要はありません。
@@ -143,29 +149,50 @@ DSH headless 側の設定が異なっていても、選択したモデルを渡�
 
 初回作成時に =.gitignore= へ =.critmagit/= を追加します。
 
-- =M-x crit-magit-comment= — diff の現在行または region にコメント
-- =M-x crit-magit-comment-file= — diff の現在ファイル全体にコメント
-- =M-x crit-magit-review-session= — 保存済み未解決コメントを DSH に送る
+- =M-x crit-magit-comment= — diff の現在行または region にコメント（蓄積のみ）
+- =M-x crit-magit-comment-file= — diff の現在ファイル全体にコメント（蓄積のみ）
+- =M-x crit-magit-send-session= — 蓄積した未解決コメントを確定して DSH へまとめて送る（=C-c C-s=）
+- =M-x crit-magit-review-session= — 確認なしで保存済み未解決コメントを DSH に送る
 - =M-x crit-magit-open-session= — 現在のセッションファイルを開く
 - =M-x crit-magit-copy-session-file= — AI へ渡す指示文を kill-ring にコピー
 - =M-x crit-magit-set-session= — 現在のセッション ID を設定・変更する
 
-=crit-magit-review-after-comment= は既定で有効です。コメントを保存すると、
-ACP でモデルを選択した後、DSH が未解決コメントを読み、必要なソース変更と
-再レビューを行います。DSH はセッションファイル自体を編集せず、commit や
-push もしないよう指示します。DSH の出力を確認してから変更を採用してください。
+既定では、コメントを =C-c c= や =C-c f= で保存しても DSH には何も送られず、
+セッションファイルに蓄積していくだけです。複数のコメントを書き終えてから
+=C-c C-s=（=M-x crit-magit-send-session=）で確定すると、未解決コメントを
+まとめて DSH へレビュー依頼できます。コメント保存直後に即送信したい場合は
+=(setq crit-magit-review-after-comment t)= を設定してください。
 
-コメントをまとめてから送る場合は =(setq crit-magit-review-after-comment nil)=
-を設定し、コメントを追加後、=crit-magit-review-whole= で全diffとコメントを
-レビューさせるか、=crit-magit-review-session= でコメントへの対応を依頼します。
-DSH の実行中に追加したコメントは保存し、後で =crit-magit-review-session= から
-再送できます。実行中の依頼へ自動追加はしません。
+DSH への依頼はすべてレビュー専用です。プロンプトには「ファイルを変更・作成・
+削除しない」「commit・push しない」と明示的に指示され、DSH は各コメント ID
+ごとに、判定・根拠・別の AI エージェントが適用できる具体的な修正案を書いた
+REVIEW コメントを出力します。実際のソース修正は DSH の出力を確認した上で、
+自分または別の AI エージェントに適用させてください。
+
+DSH の実行中に追加したコメントも保存され、後で =C-c C-s= から再送できます。
+実行中の依頼へ自動追加はしません。
 
 行範囲は同じ hunk 内で指定します。追加側と削除側を混在させた範囲は、
 一部だけを黙って送らずエラーにします。両側への指摘はファイルコメントを使ってください。
 コメント保存は読み取りから置換までロックします。異常終了で
 =.critmagit/<session-id>.md.lock/= が残った場合は、他の書き込みが動いていない
 ことを確認してから、その空ディレクトリを削除してください。
+
+** 進行状況の表示
+
+レビュー依頼を送ると、=*crit-magit-progress*= バッファ
+（=crit-magit-progress-buffer-name=）が自動的に開き、開始から終了までの
+全段階がタイムスタンプ付きで記録されます。
+
+- ACP モデル探索の各フェーズ（サーバー起動、モデル一覧取得、セッション閉鎖）
+- 選択したモデルとレビュー要求の送信
+- DSH の標準出力（モデルの応答）のストリーミング表示
+- プロセスの終了状態と stderr
+
+モードラインにも =crit: DSH review (12s, C-c C-k to cancel)= のように
+経過秒と中止操作が表示されます。=C-c C-k=（=M-x crit-magit-cancel-review=）
+で実行中の依頼を中止できます。最終的なレビュー結果は
+=*crit-magit-review*= バッファに表示されます。
 
 ** 検証
 
