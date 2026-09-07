@@ -9,6 +9,15 @@ import time
 args = sys.argv[1:]
 scenario = os.environ.get('CRIT_MAGIT_TEST_SCENARIO', 'normal')
 if args[args.index('--profile') + 1] == 'acp':
+    patch_path = args[args.index('--patch') + 1] if '--patch' in args else None
+    model_options = [{'id': 'model', 'type': 'select',
+                      'currentValue': '["test-provider","test-model"]',
+                      'options': [{'name': 'Test', 'value': '["test-provider","test-model"]'}]}]
+    def update(kind, **fields):
+        print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update',
+                          'params': {'sessionId': 'test', 'update': {
+                              'sessionUpdate': kind, **fields}}}, ensure_ascii=False), flush=True)
+
     for line in sys.stdin:
         request = json.loads(line)
         method = request.get('method')
@@ -19,11 +28,37 @@ if args[args.index('--profile') + 1] == 'acp':
         if method == 'initialize':
             result = {'protocolVersion': 1, 'agentCapabilities': {}}
         elif method == 'session/new':
-            result = {'sessionId': 'test', 'configOptions': [{
-                'id': 'model', 'type': 'select',
-                'currentValue': '["test-provider","test-model"]',
-                'options': [{'name': 'Test', 'value': '["test-provider","test-model"]'}]
-            }]}
+            result = {'sessionId': 'test', 'configOptions': model_options}
+        elif method == 'session/set_config_option':
+            assert request['params']['value'] == model_options[0]['currentValue']
+            if scenario == 'model-mismatch':
+                model_options[0]['currentValue'] = '["wrong","model"]'
+            result = {'configOptions': model_options}
+        elif method == 'session/prompt':
+            assert patch_path, 'Review must pass a read-only patch'
+            patch = Path(patch_path).read_text()
+            assert 'mode: read-only' in patch and 'policy: never' in patch
+            assert 'defaultPreset: read-only' in patch
+            assert os.environ['DSH_PERMISSION_MODE'] == 'read-only'
+            if scenario == 'review-hang':
+                time.sleep(30)
+            if scenario == 'review-error':
+                print('fixture review failure', file=sys.stderr, flush=True)
+                sys.exit(7)
+            prompt = request['params']['prompt'][0]['text']
+            update('agent_thought_chunk', content={'type': 'text', 'text': 'PRIVATE THOUGHT'})
+            update('tool_call', title='Reading source', status='in_progress')
+            print(json.dumps({'jsonrpc': '2.0', 'id': 90, 'method': 'session/request_permission',
+                              'params': {'sessionId': 'test', 'options': [
+                                  {'optionId': 'allow', 'kind': 'allow_once'}]}}), flush=True)
+            permission = json.loads(sys.stdin.readline())
+            assert permission['result']['outcome']['outcome'] == 'cancelled'
+            answer = json.dumps({'prompt': prompt, 'patch_path': patch_path, 'patch': patch,
+                                 'cwd': os.getcwd(), 'permission_denied': True}, ensure_ascii=False)
+            if scenario != 'empty-answer':
+                update('agent_message_chunk', content={'type': 'text', 'text': answer[:11]})
+                update('agent_message_chunk', content={'type': 'text', 'text': answer[11:]})
+            result = {'stopReason': 'cancelled' if scenario == 'cancelled-answer' else 'end_turn'}
         elif method == 'session/close':
             if scenario == 'no-close':
                 print(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
