@@ -546,4 +546,165 @@
           (with-current-buffer draft (set-buffer-modified-p nil))
           (kill-buffer draft))))))
 
+(defconst crit-magit-test--navigation-diff
+  (concat "Staged changes (HEAD to index):\n"
+          "diff --git a/a b/a\n--- a/a\n+++ b/a\n"
+          "@@ -1 +1 @@\n-old a\n+new a\n"
+          "@@ -10 +10 @@\n-old again\n+new again\n"
+          "diff --git a/b b/b\n--- a/b\n+++ b/b\n"
+          "@@ -1 +1 @@\n-old b\n+new b\n"
+          "\nUnstaged changes (index to worktree):\n"
+          "diff --git a/a b/a\n--- a/a\n+++ b/a\n"
+          "@@ -1 +1 @@\n-new a\n+working a\n"))
+
+(defmacro crit-magit-test--with-navigation (&rest body)
+  (declare (indent 0))
+  `(with-temp-buffer
+     (crit-magit-draft-mode)
+     (setq crit-magit--draft-root "/tmp/repo" crit-magit--draft-head "abc")
+     (crit-magit--draft-initialize crit-magit-test--navigation-diff)
+     ,@body))
+
+(defun crit-magit-test--press (key)
+  "Invoke the binding for KEY with its actual last input event."
+  (let* ((keys (kbd key))
+         (last-command-event (aref keys (1- (length keys)))))
+    (call-interactively (key-binding keys))))
+
+(ert-deftest crit-magit-navigation-visible-hierarchy ()
+  (crit-magit-test--with-navigation
+    (should (equal (mapcar #'crit-magit--draft-section-kind crit-magit--draft-sections)
+                   '(group file hunk hunk file hunk group file hunk)))
+    (crit-magit-test--press "n")
+    (should (looking-at "diff --git a/a"))
+    (crit-magit-test--press "n")
+    (should (looking-at "@@ -1"))
+    (search-forward "+new a")
+    (crit-magit-test--press "p")
+    (should (looking-at "@@ -1"))
+    (crit-magit-test--press "p")
+    (should (looking-at "diff --git a/a"))
+    (crit-magit-test--press "TAB")
+    (should (invisible-p (crit-magit--draft-section-start (nth 2 crit-magit--draft-sections))))
+    (crit-magit-test--press "n")
+    (should (looking-at "diff --git a/b"))
+    (crit-magit-test--press "p")
+    (should (looking-at "diff --git a/a"))
+    (crit-magit-test--press "TAB")
+    (crit-magit-test--press "n")
+    (should (looking-at "@@ -1"))
+    (crit-magit-test--press "TAB")
+    (crit-magit-test--press "n")
+    (should (looking-at "@@ -10"))))
+
+(ert-deftest crit-magit-navigation-list-fold-preserves-child-fold ()
+  (crit-magit-test--with-navigation
+    (crit-magit-draft-next)
+    (crit-magit-draft-toggle)
+    (crit-magit-draft-previous)
+    (should (looking-at "Staged changes"))
+    (crit-magit-draft-toggle)
+    (crit-magit-draft-next)
+    (should (looking-at "Unstaged changes"))
+    (crit-magit-draft-previous)
+    (crit-magit-draft-toggle)
+    (crit-magit-draft-next)
+    (should (looking-at "diff --git a/a"))
+    (crit-magit-draft-next)
+    (should (looking-at "diff --git a/b"))))
+
+(ert-deftest crit-magit-navigation-comments-and-folded-export ()
+  (crit-magit-test--with-navigation
+    (crit-magit-test--press "i")
+    (crit-magit-test--press "n")
+    (crit-magit-test--press "p")
+    (crit-magit-test--press "TAB")
+    (crit-magit-test--press "i")
+    (should (equal (cdar (crit-magit--draft-comments)) "\nnp\ti"))
+    ;; At the boundary after a global comment, explicit navigation must restore n/p.
+    (crit-magit-test--press "C-c C-n")
+    (should (looking-at "diff --git a/a"))
+    (crit-magit-test--press "n")
+    (should (looking-at "@@ -1"))
+    (search-forward "+new a")
+    (crit-magit-test--press "i")
+    (insert "行コメント ")
+    (crit-magit-test--press "n")
+    (crit-magit-test--press "p")
+    (let ((markdown (crit-magit--draft-markdown))
+          (tick (buffer-chars-modified-tick)))
+      (goto-char (crit-magit--draft-section-start (car crit-magit--draft-sections)))
+      (crit-magit-draft-toggle)
+      (should (= tick (buffer-chars-modified-tick)))
+      (should (equal markdown (crit-magit--draft-markdown)))
+      (crit-magit-draft-next)
+      (should (looking-at "Unstaged changes")))))
+
+(ert-deftest crit-magit-navigation-markers-survive-undo ()
+  (crit-magit-test--with-navigation
+    (insert "全体コメント\n")
+    (undo-boundary)
+    (undo-only 1)
+    (undo-redo)
+    (crit-magit-draft-next)
+    (should (looking-at "Staged changes"))
+    (crit-magit-draft-next)
+    (should (looking-at "diff --git a/a"))
+    (crit-magit-draft-toggle)
+    (crit-magit-draft-next)
+    (should (looking-at "diff --git a/b"))
+    (should (equal (cdar (crit-magit--draft-comments)) "全体コメント\n"))))
+
+(ert-deftest crit-magit-navigation-search-reveal-and-cleanup ()
+  (crit-magit-test--with-navigation
+    (crit-magit-draft-toggle)
+    (let* ((section (car crit-magit--draft-sections))
+           (overlay (crit-magit--draft-section-overlay section))
+           (marker (crit-magit--draft-section-start section)))
+      (should (overlay-get overlay 'invisible))
+      (funcall (overlay-get overlay 'isearch-open-invisible) overlay)
+      (should-not (overlay-get overlay 'invisible))
+      (fundamental-mode)
+      (should-not (overlay-buffer overlay))
+      (should-not (marker-buffer marker)))))
+
+(ert-deftest crit-magit-navigation-keyboard-command-loop ()
+  (crit-magit-test--with-navigation
+    (save-window-excursion
+      (switch-to-buffer (current-buffer))
+      (execute-kbd-macro (kbd "n TAB n p <tab> n"))
+      (should (looking-at "@@ -1"))
+      (execute-kbd-macro (kbd "i n p i"))
+      (should (string-match-p "npi" (cdar (crit-magit--draft-comments))))
+      (execute-kbd-macro (kbd "C-c <tab>"))
+      (should (looking-at "@@ -1"))
+      (should (overlay-get
+               (crit-magit--draft-section-overlay (crit-magit--draft-section-at-point))
+               'invisible)))))
+
+(ert-deftest crit-magit-navigation-real-magit-sections ()
+  :tags '(integration)
+  (skip-unless (require 'magit nil t))
+  (crit-magit-test--with-repo
+    (dolist (path '("a.txt" "b.txt")) (with-temp-file path (insert "old\n")))
+    (crit-magit--git-output repo "add" ".")
+    (crit-magit--git-output repo "commit" "-qm" "initial")
+    (dolist (path '("a.txt" "b.txt")) (with-temp-file path (insert "new\n")))
+    (let (draft)
+      (unwind-protect
+          (progn
+            (with-current-buffer (magit-diff-setup-buffer nil nil nil nil)
+              (crit-magit)
+              (setq draft (current-buffer)))
+            (with-current-buffer draft
+              (let ((files (cl-remove-if-not
+                            (lambda (s) (eq (crit-magit--draft-section-kind s) 'file))
+                            crit-magit--draft-sections)))
+                (should (= (length files) 2))
+                (goto-char (crit-magit--draft-section-start (car files)))
+                (crit-magit-test--press "TAB")
+                (crit-magit-test--press "n")
+                (should (= (point) (crit-magit--draft-section-start (cadr files)))))))
+        (when (buffer-live-p draft) (kill-buffer draft))))))
+
 (provide 'crit-magit-regression-test)

@@ -60,6 +60,7 @@
 (require 'subr-x)
 (require 'eieio)
 (require 'diff-mode)
+(require 'cl-lib)
 
 (defgroup crit-magit nil
   "Local AI review comments from Magit diff buffers."
@@ -1937,6 +1938,151 @@ status buffer the working-tree diff (staged and unstaged) is
 (defvar-local crit-magit--draft-insertion-anchor nil
   "Comment target captured before the current edit.")
 
+(cl-defstruct (crit-magit--draft-section
+               (:constructor crit-magit--make-draft-section))
+  "A presentation section whose positions follow comment edits."
+  kind start body end parent overlay heading)
+
+(defvar-local crit-magit--draft-sections nil
+  "Ordered group, file and hunk sections of the captured diff.")
+
+(defvar-local crit-magit--draft-navigating nil
+  "Non-nil after section navigation, until the next comment edit.")
+
+(defun crit-magit--draft-clear-sections ()
+  "Release the presentation overlays and markers belonging to this draft."
+  (dolist (section crit-magit--draft-sections)
+    (delete-overlay (crit-magit--draft-section-overlay section))
+    (delete-overlay (crit-magit--draft-section-heading section))
+    (dolist (marker (list (crit-magit--draft-section-start section)
+                          (crit-magit--draft-section-body section)
+                          (crit-magit--draft-section-end section)))
+      (set-marker marker nil)))
+  (setq crit-magit--draft-sections nil))
+
+(defun crit-magit--draft-build-sections (headings)
+  "Build foldable sections from ordered HEADINGS of (KIND START BODY)."
+  (crit-magit--draft-clear-sections)
+  (let (stack sections)
+    (dolist (entry headings)
+      (pcase-let* ((`(,kind ,start ,body) entry)
+                   (rank (cl-position kind '(group file hunk))))
+        (while (and stack
+                    (<= rank (cl-position (crit-magit--draft-section-kind (car stack))
+                                          '(group file hunk))))
+          (setf (crit-magit--draft-section-end (pop stack)) (copy-marker start)))
+        (let ((section (crit-magit--make-draft-section
+                        :kind kind :start (copy-marker start t)
+                        :body (copy-marker body) :parent (car stack)
+                        :overlay (make-overlay body body nil nil t)
+                        :heading (make-overlay start start nil t t))))
+          (overlay-put (crit-magit--draft-section-heading section)
+                       'before-string (propertize "▾ " 'face 'shadow))
+          (push section sections)
+          (push section stack))))
+    (dolist (section stack)
+      (setf (crit-magit--draft-section-end section) (copy-marker (point-max) t)))
+    (setq crit-magit--draft-sections (nreverse sections))))
+
+(defun crit-magit--draft-section-at-point ()
+  "Return the innermost visible section containing point."
+  (let ((pos (point)) found)
+    (dolist (section crit-magit--draft-sections)
+      (when (and (<= (crit-magit--draft-section-start section) pos)
+                 (or (< pos (crit-magit--draft-section-end section))
+                     (= pos (crit-magit--draft-section-end section) (point-max)))
+                 (not (invisible-p (crit-magit--draft-section-start section))))
+        (setq found section)))
+    found))
+
+(defun crit-magit-draft-next ()
+  "Move to the next visible diff section, skipping collapsed bodies."
+  (interactive)
+  (let ((next (cl-find-if
+               (lambda (section)
+                 (let ((start (crit-magit--draft-section-start section)))
+                   (and (> start (point)) (<= start (point-max))
+                        (not (invisible-p start)))))
+               crit-magit--draft-sections)))
+    (unless next (user-error "次の差分項目はありません"))
+    (setq crit-magit--draft-navigating t)
+    (goto-char (crit-magit--draft-section-start next))))
+
+(defun crit-magit-draft-previous ()
+  "Move to the current section heading or the previous visible section."
+  (interactive)
+  (let (previous)
+    (dolist (section crit-magit--draft-sections)
+      (let ((start (crit-magit--draft-section-start section)))
+        (when (and (< start (point)) (>= start (point-min)) (not (invisible-p start)))
+          (setq previous section))))
+    (unless previous (user-error "前の差分項目はありません"))
+    (setq crit-magit--draft-navigating t)
+    (goto-char (crit-magit--draft-section-start previous))))
+
+(defun crit-magit-draft-toggle ()
+  "Toggle the current group's, file's or hunk's diff body."
+  (interactive)
+  (let ((section (crit-magit--draft-section-at-point)))
+    (unless section (user-error "開閉する差分項目がありません"))
+    (let* ((overlay (crit-magit--draft-section-overlay section))
+           (hide (not (overlay-get overlay 'invisible)))
+           (start (1- (marker-position (crit-magit--draft-section-body section))))
+           (end (marker-position (crit-magit--draft-section-end section))))
+      (when (>= (crit-magit--draft-section-body section) end)
+        (user-error "この差分項目に本文はありません"))
+      (when (eq (char-before end) ?\n) (setq end (1- end)))
+      (move-overlay overlay start (max start end))
+      (overlay-put overlay 'invisible (and hide 'crit-magit-fold))
+      (overlay-put overlay 'isearch-open-invisible #'crit-magit--draft-isearch-open)
+      (overlay-put overlay 'crit-magit-section section)
+      (overlay-put (crit-magit--draft-section-heading section)
+                   'before-string (propertize (if hide "▸ " "▾ ") 'face 'shadow))
+      (setq crit-magit--draft-navigating t)
+      (when hide (goto-char (crit-magit--draft-section-start section))))))
+
+(defun crit-magit--draft-isearch-open (overlay)
+  "Reveal the section hidden by OVERLAY when incremental search finds a match."
+  (overlay-put overlay 'invisible nil)
+  (when-let ((section (overlay-get overlay 'crit-magit-section)))
+    (overlay-put (crit-magit--draft-section-heading section)
+                 'before-string (propertize "▾ " 'face 'shadow))))
+
+(defun crit-magit--draft-in-comment-p ()
+  "Return non-nil inside or immediately after an editable comment."
+  (or (get-text-property (point) 'crit-magit-comment)
+      (and (not crit-magit--draft-navigating) (> (point) (point-min))
+           (get-text-property (1- (point)) 'crit-magit-comment))))
+
+(defun crit-magit-draft-next-or-insert ()
+  "Insert n in a comment; otherwise move to the next diff section."
+  (interactive)
+  (if (crit-magit--draft-in-comment-p) (self-insert-command 1)
+    (crit-magit-draft-next)))
+
+(defun crit-magit-draft-previous-or-insert ()
+  "Insert p in a comment; otherwise move to the previous diff section."
+  (interactive)
+  (if (crit-magit--draft-in-comment-p) (self-insert-command 1)
+    (crit-magit-draft-previous)))
+
+(defun crit-magit-draft-toggle-or-indent ()
+  "Insert a tab in a comment; otherwise toggle the current diff section."
+  (interactive)
+  (if (crit-magit--draft-in-comment-p) (insert "\t")
+    (crit-magit-draft-toggle)))
+
+(defun crit-magit-draft-insert-comment ()
+  "Start a comment below the current source line, or insert i in a comment."
+  (interactive)
+  (if (crit-magit--draft-in-comment-p) (self-insert-command 1)
+    ;; Preserve any existing folds; the new comment belongs to this heading/line.
+    (when-let ((section (crit-magit--draft-section-at-point)))
+      (when (overlay-get (crit-magit--draft-section-overlay section) 'invisible)
+        (crit-magit-draft-toggle)))
+    (unless (bobp) (end-of-line))
+    (insert "\n")))
+
 (defun crit-magit--draft-before-change (beg end)
   "Capture the comment target before editing BEG through END."
   (ignore end)
@@ -1956,6 +2102,7 @@ status buffer the working-tree diff (staged and unstaged) is
 (defun crit-magit--draft-after-change (beg end _old-length)
   "Mark text inserted between BEG and END as a distinct reviewer comment."
   (when (and crit-magit--draft-original (not undo-in-progress) (< beg end))
+    (setq crit-magit--draft-navigating nil)
     (with-silent-modifications
       ;; Pasting a copied source line must create a comment, not new source.
       (set-text-properties
@@ -1968,12 +2115,13 @@ status buffer the working-tree diff (staged and unstaged) is
   (unless (or (equal text "/dev/null") (string-prefix-p "\"" text))
     (string-remove-prefix "b/" (string-remove-prefix "a/" text))))
 
-(defun crit-magit--draft-initialize (diff &optional files)
+(defun crit-magit--draft-initialize (diff &optional files file-headings)
   "Insert immutable DIFF and attach original line anchors.
 FILES, when non-nil, contains Magit file identities in displayed line order.
+FILE-HEADINGS contains captured line numbers of actual Magit file headings.
 Unrecognized formats retain a captured-diff line reference instead of guessing."
   (let ((inhibit-modification-hooks t)
-        (line-number 0) old new old-path new-path layer previous-file)
+        (line-number 0) old new old-path new-path layer previous-file headings)
     (insert diff)
     (setq crit-magit--draft-original (substring-no-properties diff))
     (save-excursion
@@ -1982,6 +2130,11 @@ Unrecognized formats retain a captured-diff line reference instead of guessing."
         (let* ((beg (point))
                (line (buffer-substring-no-properties beg (line-end-position)))
                (file (pop files))
+               (kind (cond ((string-match-p "^\\(?:Staged\\|Unstaged\\) changes " line) 'group)
+                           ((or (string-prefix-p "diff --git " line)
+                                (when (equal (1+ line-number) (car file-headings))
+                                  (pop file-headings) t)) 'file)
+                           ((string-prefix-p "@@" line) 'hunk)))
                (anchor nil))
           (setq line-number (1+ line-number))
           (when (and file (not (equal file previous-file)))
@@ -2016,9 +2169,11 @@ Unrecognized formats retain a captured-diff line reference instead of guessing."
             (setq anchor (list :path (or new-path old-path file) :side 'file)))
           (setq anchor (append anchor (list :diff-line line-number :layer layer)))
           (forward-line 1)
+          (when kind (push (list kind beg (point)) headings))
           (add-text-properties beg (point)
                                (list 'crit-magit-source t 'crit-magit-anchor anchor
                                      'read-only t 'front-sticky nil 'rear-nonsticky t)))))
+    (crit-magit--draft-build-sections (nreverse headings))
     (goto-char (point-min))
     ;; Initial source insertion must never be undone by a comment-editing undo.
     (setq buffer-undo-list nil)
@@ -2081,16 +2236,30 @@ Unrecognized formats retain a captured-diff line reference instead of guessing."
     map)
   "Keymap for editing a review draft.")
 
+;; Also update an already-loaded mode map when the source is reloaded.
+(define-key crit-magit-draft-mode-map (kbd "n") #'crit-magit-draft-next-or-insert)
+(define-key crit-magit-draft-mode-map (kbd "p") #'crit-magit-draft-previous-or-insert)
+(define-key crit-magit-draft-mode-map (kbd "TAB") #'crit-magit-draft-toggle-or-indent)
+(define-key crit-magit-draft-mode-map [tab] #'crit-magit-draft-toggle-or-indent)
+(define-key crit-magit-draft-mode-map (kbd "i") #'crit-magit-draft-insert-comment)
+(define-key crit-magit-draft-mode-map (kbd "C-c C-n") #'crit-magit-draft-next)
+(define-key crit-magit-draft-mode-map (kbd "C-c C-p") #'crit-magit-draft-previous)
+(define-key crit-magit-draft-mode-map (kbd "C-c TAB") #'crit-magit-draft-toggle)
+(define-key crit-magit-draft-mode-map (kbd "C-c <tab>") #'crit-magit-draft-toggle)
+
 (define-derived-mode crit-magit-draft-mode diff-mode "Crit-Magit"
   "Add editable comments to a protected diff snapshot.
 \\{crit-magit-draft-mode-map}"
   (setq buffer-read-only nil)
   (setq-local diff-update-on-the-fly nil)
+  (add-to-invisibility-spec '(crit-magit-fold . t))
   (setq-local header-line-format
-              "Diffへコメントを追記 → C-c C-c: 確定して閉じる  |  C-c C-d: DSH  |  C-c C-e: Markdown")
+              "n/p: 項目移動  TAB: 開閉  i: コメント  |  C-c C-c: 確定して閉じる")
   (setq-local buffer-offer-save t)
   (add-hook 'before-change-functions #'crit-magit--draft-before-change nil t)
-  (add-hook 'after-change-functions #'crit-magit--draft-after-change nil t))
+  (add-hook 'after-change-functions #'crit-magit--draft-after-change nil t)
+  (add-hook 'change-major-mode-hook #'crit-magit--draft-clear-sections nil t)
+  (add-hook 'kill-buffer-hook #'crit-magit--draft-clear-sections nil t))
 
 ;;;###autoload
 (defun crit-magit ()
@@ -2103,17 +2272,23 @@ No source, index, session file or gitignore is modified."
          (diff (if (derived-mode-p 'magit-status-mode)
                    (crit-magit--working-tree-diff root)
                  (crit-magit--buffer-diff)))
+         (file-headings nil)
          (files (when (derived-mode-p 'magit-diff-mode)
                   (save-excursion
                     (save-restriction
                       (widen)
                       (goto-char (point-min))
-                      (let (paths)
+                      (let ((number 0) paths)
                         (while (not (eobp))
+                          (setq number (1+ number))
+                          (when-let ((section (crit-magit--section 'file)))
+                            (when (= (point) (crit-magit--section-slot section 'start))
+                              (push number file-headings)))
                           (push (ignore-errors
                                   (crit-magit--normalize-path
                                    (crit-magit--file-at-point) root)) paths)
                           (forward-line 1))
+                        (setq file-headings (nreverse file-headings))
                         (nreverse paths))))))
          (head (string-trim
                 (condition-case nil (crit-magit--git-output root "rev-parse" "HEAD")
@@ -2124,7 +2299,7 @@ No source, index, session file or gitignore is modified."
     (setq default-directory (file-name-as-directory root)
           crit-magit--draft-root root
           crit-magit--draft-head head)
-    (crit-magit--draft-initialize diff files)))
+    (crit-magit--draft-initialize diff files file-headings)))
 
 (defun crit-magit--draft-markdown ()
   "Export located reviewer comments separately from the unmodified diff."
