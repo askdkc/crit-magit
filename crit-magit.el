@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 askdkc
 
-;; Version: 0.1.3
+;; Version: 0.1.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, vc
 
@@ -1218,8 +1218,8 @@ Only the standard select option whose id is `model' is accepted."
             (when (equal (crit-magit--json-object-value option "id") "model")
               (dolist (entry (crit-magit--json-object-value option "options"))
                 (dolist (item (if (crit-magit--json-object-value entry "group")
-                                 (crit-magit--json-object-value entry "options")
-                               (list entry)))
+                                  (crit-magit--json-object-value entry "options")
+				(list entry)))
                   (let ((candidate (crit-magit--json-object-value item "value")))
                     (when (equal selection (crit-magit--dsh-selection-from-value candidate))
                       (setq value candidate)))))))
@@ -1300,7 +1300,7 @@ Only the standard select option whose id is `model' is accepted."
          (setf (plist-get state :phase) 'new-session
                (plist-get state :expected-id) 2)
          (crit-magit--acp-send process 2 "session/new"
-                              `((cwd . ,(plist-get state :root)) (mcpServers . []))))
+                               `((cwd . ,(plist-get state :root)) (mcpServers . []))))
         ('new-session
          (let ((session (crit-magit--json-object-value result "sessionId"))
                (options (crit-magit--json-object-value result "configOptions")))
@@ -1342,7 +1342,7 @@ Only the standard select option whose id is `model' is accepted."
                               #'crit-magit--acp-failure process state callback
                               "DSH ACP close timed out"))
            (crit-magit--acp-send process 5 "session/close"
-                                `((sessionId . ,(plist-get state :session-id))))))
+                                 `((sessionId . ,(plist-get state :session-id))))))
         ('close-review
          (crit-magit--acp-finish process state callback
                                  (cons 'success (plist-get state :answer)))))))))
@@ -1413,21 +1413,21 @@ With PROMPT, select a model and run a read-only review on the same connection."
                           (setenv "DSH_PERMISSION_MODE" "read-only")
                           (setf (plist-get state :patch) patch)))
                (process
-               (make-process
-                :name "crit-magit-acp"
-                :buffer nil
-                :command (append (list crit-magit-dsh-command
-                                       "--profile" crit-magit-dsh-acp-profile)
-                                 (when patch (list "--patch" patch)))
-                :stderr stderr-buffer
-                :coding 'utf-8-unix
-                :noquery t
-                :connection-type 'pipe
-                :filter (lambda (proc chunk)
-                          (crit-magit--acp-filter proc state callback chunk))
-                :sentinel (lambda (proc event)
-                            (crit-magit--acp-sentinel
-                             proc state callback event)))))
+		(make-process
+                 :name "crit-magit-acp"
+                 :buffer nil
+                 :command (append (list crit-magit-dsh-command
+					"--profile" crit-magit-dsh-acp-profile)
+                                  (when patch (list "--patch" patch)))
+                 :stderr stderr-buffer
+                 :coding 'utf-8-unix
+                 :noquery t
+                 :connection-type 'pipe
+                 :filter (lambda (proc chunk)
+                           (crit-magit--acp-filter proc state callback chunk))
+                 :sentinel (lambda (proc event)
+                             (crit-magit--acp-sentinel
+                              proc state callback event)))))
           (crit-magit--set-dsh-process process 'model-discovery)
           (setf (plist-get state :timer)
                 (run-at-time crit-magit-dsh-discovery-timeout nil
