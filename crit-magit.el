@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 askdkc
 
-;; Version: 0.1.5
+;; Version: 0.1.7
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, vc
 
@@ -2252,6 +2252,14 @@ Unrecognized formats retain a captured-diff line reference instead of guessing."
 \\{crit-magit-draft-mode-map}"
   (setq buffer-read-only nil)
   (setq-local diff-update-on-the-fly nil)
+  ;; The parent mode has already registered its hunk-count updater.  Merely
+  ;; changing the option here does not stop that deferred buffer mutation.
+  (when (bound-and-true-p diff--track-changes)
+    (track-changes-unregister diff--track-changes)
+    (setq diff--track-changes nil))
+  ;; When automatic updates were disabled before entering the parent mode,
+  ;; it installed a save-time updater instead.  A review draft needs neither.
+  (remove-hook 'write-contents-functions #'diff-write-contents-hooks t)
   (add-to-invisibility-spec '(crit-magit-fold . t))
   (setq-local header-line-format
               "n/p: 項目移動  TAB: 開閉  i: コメント  |  C-c C-c: 確定して閉じる")

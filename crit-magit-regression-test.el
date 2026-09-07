@@ -461,6 +461,53 @@
       (should (equal (substring-no-properties copied)
                      (cdar (crit-magit--draft-comments)))))))
 
+(ert-deftest crit-magit-draft-typing-with-timers-then-submit ()
+  "Comment input must survive Diff's deferred work before Markdown export."
+  (dolist (automatic '(t nil))
+    (dolist (keys '("コメント" "SPC コメント" "- SPC コメント" "+ SPC コメント"))
+      (let ((diff-update-on-the-fly automatic)
+            (crit-magit-dsh-review-buffer-name " *crit-magit-timer-test*")
+            copied)
+        (unwind-protect
+            (crit-magit-test--with-draft
+              (save-window-excursion
+                (switch-to-buffer (current-buffer))
+                ;; Let deferred work run between edits, as it does while a
+                ;; person types.  A single uninterrupted macro hid the bug.
+                (execute-kbd-macro (kbd "i 全体コメント"))
+                (accept-process-output nil 0.01)
+                (search-forward "crit-magit-review)")
+                (execute-kbd-macro (kbd "i"))
+                (accept-process-output nil 0.01)
+                (execute-kbd-macro (kbd keys))
+                (accept-process-output nil 0.01)
+                (let ((draft (current-buffer)))
+                  (cl-letf (((symbol-function 'crit-magit--copy-review)
+                             (lambda (text) (setq copied text) t)))
+                    (execute-kbd-macro (kbd "C-c C-c 2")))
+                  (should-not (buffer-live-p draft)))
+                (with-current-buffer crit-magit-dsh-review-buffer-name
+                  (should (equal (buffer-string) copied)))
+                (should (string-match-p "> 全体コメント" copied))
+                (should (string-match-p "> [-+]? ?コメント" copied))
+                (should (string-suffix-p
+                         (concat "```diff\n" crit-magit-test--annotated-diff "```\n")
+                         copied))))
+          (when-let ((buffer (get-buffer crit-magit-dsh-review-buffer-name)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest crit-magit-draft-save-does-not-fixup-hunks ()
+  "Diff's save-time fallback must not reinterpret reviewer prose as a patch."
+  (dolist (automatic '(t nil))
+    (let ((diff-update-on-the-fly automatic))
+      (crit-magit-test--with-draft
+        (search-forward "crit-magit-review)")
+        (insert "\n コメント")
+        (let ((text (buffer-string)))
+          (run-hook-with-args-until-success 'write-contents-functions)
+          (should (equal (buffer-string) text))
+          (should (equal (cdar (crit-magit--draft-comments)) "\n コメント")))))))
+
 (ert-deftest crit-magit-draft-closes-only-on-successful-submission ()
   (dolist (choice '(?1 ?2))
     (crit-magit-test--with-draft
