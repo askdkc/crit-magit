@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 askdkc
 
-;; Version: 0.1.7
+;; Version: 0.1.8
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, vc
 
