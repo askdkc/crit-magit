@@ -33,6 +33,7 @@ Magit status と diff の両方から =C-c r= で起動できる設定です。
 
 #+begin_src emacs-lisp
 (use-package crit-magit
+  :vc (:url "https://github.com/askdkc/crit-magit" :rev :newest)
   :after magit
   :bind ((:map magit-status-mode-map
               ("C-c r" . crit-magit))
