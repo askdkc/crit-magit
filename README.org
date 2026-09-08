@@ -1,6 +1,3 @@
-#+title: crit-magit
-#+language: ja
-
 * crit-magit
 
 =crit-magit= は、Magit の staged／unstaged diff にコメントを書き込み、
