@@ -1,224 +1,55 @@
 #+title: crit-magit
 #+language: ja
 
-* 使い方
+* crit-magit
 
-1. =C-x g= で Magit status を開き、 =C-c r= （ =M-x crit-magit= ）を実行します。
-   カーソル位置や折り畳みに関係なく、staged／unstaged の全差分を写した
-   =*crit-magit-draft*= バッファが新たに開きます。未追跡ファイルは含みません。
-2. =n= ／ =p= で差分項目へ移動し、 =TAB= で開閉します。
-   一覧（staged／unstaged）、ファイル、変更箇所（hunk）の各見出しを操作できます。
-   閉じた項目の中身は移動時に飛ばします。 =p= は本文から見出しへ戻り、
-   見出し上では前の項目へ移動します。
-3. =i= で現在行の下にコメントを書き始めます。バッファ先頭の =i= は全体コメントです。
-   行末への直接入力もできます。
-   コメントには通常の文字入力、改行、選択、Undo／Redo が使えます。
-   元のDiff本文は保護され、削除・置換できません。ソースや index は変わりません。
-4. =C-c C-c= で出力方法を選びます。
-   - =1= : DSH ACP で読み取り専用レビュー。モデル選択後、画面下部のエコー領域
-     （ミニバッファと同じ場所）に進捗を表示します。完了すると進捗表示を消し、
-     レビュー結果を =*crit-magit-review*= に表示します。
-   - =2= : コメントと元Diffを分けた Markdown に整えて、同じ
-     レビューバッファに表示します。DSH の起動・設定は不要です。
+=crit-magit= は、Magit の staged／unstaged diff にコメントを書き込み、
+AI レビュー用の Markdown として出力できる Emacs パッケージです。
+元のファイルや index は変更しません。DSH を利用できる環境では、編集した内容を
+読み取り専用の AI レビューへ直接送ることもできます。
 
-コメント内の =n= ／ =p= ／ =i= は通常の文字入力、=TAB= はタブ文字の入力になります。
-コメントから項目移動に戻るには =C-c C-n= ／ =C-c C-p= を使います。
-=C-c TAB= はコメント内からでも現在項目を開閉します。
-=▾= は展開、=▸= は折り畳みを表します。折り畳んだDiffとコメントも、
-Markdown出力とDSH送信にはすべて含まれます。
+Magit status で =M-x crit-magit= を実行し、開いたバッファで操作します。
 
-どちらも結果全文を OS クリップボードと Emacs の kill ring にコピーし、
-「AIツールへレビュー結果として貼り付けられます」とバッファ上部に表示します。
-OS クリップボードが使えない環境では、kill ring へのコピーのみ成功したことを
-表示します。 =C-c C-c= で確定すると、Markdown の出力後、または DSH への
-レビュー依頼の送信後に、元の編集用バッファを閉じます。Magit のバッファは残ります。
-出力方法・モデル選択のキャンセルや送信前の失敗では、編集用バッファを残します。
-モデル選択中などに追記した未送信の内容がある場合も、破棄せず残します。
-閉じた後に DSH が失敗した場合は、エラー表示に送信済みの依頼全文を添えます。
-新しいレビューを始める場合は Magit から再度起動してください。
+- =n= ／ =p= : 差分項目を移動
+- =TAB= : 差分項目を開閉
+- =i= : コメントを入力
+- =C-c C-c= : DSH レビューまたは Markdown 出力
 
-Markdown は次の内容を分けて出力します。
+出力結果は =*crit-magit-review*= に表示され、クリップボードと kill ring に
+コピーされます。未追跡ファイルは対象に含まれません。
 
-- バッファ先頭へ追記した、全体へのコメント
-- 各コメントの対象ファイル、追加／削除側、取得時の行番号、staged／unstaged の区別
-- コメントを一切混ぜていない元Diff
+* インストール
 
-対象の位置は追記した場所から取得します。コメント本文の =;;;;= などの記号には
-依存しません。パスや行を特定できない形式は、参照Diff内の行位置を明示します。
-行番号は再取得せず、コメントと同じ時点のDiffへ結び付けます。
-
-編集バッファでは =C-c C-d= で直接 DSH レビュー、 =C-c C-e= で直接 Markdown 出力、
-=C-c C-k= で実行中のレビューを中止できます。 =C-g= は出力方法やモデルの選択を
-中止します。直接実行する =C-c C-d= ／ =C-c C-e= では編集用バッファを残します。
-編集中の内容は自動保存しません。保存する場合は =C-c C-e= で出力した
-レビューバッファを =C-x C-w= で保存してください。コメントの位置情報は
-編集中のEmacsバッファ内で管理するため、編集バッファの単なるテキスト保存では復元できません。
-この新しい操作経路では =.critmagit/= や =.gitignore= を作成・変更しません。
-
-* インストールと設定
+Emacs 30.1 以降と Magit が必要です。次の設定を =init.el= に追加してください。
 
 #+begin_src emacs-lisp
 (use-package crit-magit
-  :vc (:url "https://github.com/askdkc/crit-magit" :rev :newest)
+  :vc (:url "https://github.com/askdkc/crit-magit" :rev :newest))
+#+end_src
+
+AI レビューを使う場合のみ、DSH の =acp= プロファイルと認証設定も必要です。
+Markdown 出力だけなら DSH は不要です。
+
+* おすすめ設定
+
+Magit status と diff の両方から =C-c r= で起動できる設定です。
+
+#+begin_src emacs-lisp
+(use-package crit-magit
   :after magit
-  ;; dsh が Emacs の PATH にない場合だけ実際のパスを指定する。
-  ;; :custom
-  ;; (crit-magit-dsh-command "/path/to/deepseek-harness/apps/cli/lib/bin.js")
   :bind ((:map magit-status-mode-map
               ("C-c r" . crit-magit))
          (:map magit-diff-mode-map
               ("C-c r" . crit-magit))))
 #+end_src
 
-以前の設定で =C-c r= を =crit-magit-review-whole= や =crit-magit-review= に
-割り当てていた場合は、上記の =crit-magit= に変更してください。
-既存のレビューコマンドは直接 DSH に送信する動作を維持します。
-
-既に =crit-magit-dsh-command= で実行ファイルの場所や PATH 不在時の
-フォールバックを設定している場合は、その設定を残してください。
-キーバインドの整理と同時に削除する必要はありません。例えば次の設定では、
-=/path/to/= を実際の DSH checkout の場所に置き換えます。
+Emacs から =dsh= を見つけられない場合だけ、実行ファイルの絶対パスを指定します。
 
 #+begin_src emacs-lisp
-(setq crit-magit-dsh-command
-      (or (executable-find "dsh")
-          "/path/to/deepseek-harness/apps/cli/lib/bin.js"))
+(setq crit-magit-dsh-command "/path/to/dsh")
 #+end_src
 
-初回起動時に =use-package= の VC サポートが利用できない場合は、まず
-次を評価してください。
+* ライセンス
 
-#+begin_src emacs-lisp
-(require 'package)
-(package-initialize)
-#+end_src
-
-#+begin_src emacs-lisp
-(require 'use-package)
-#+end_src
-
-* DSH(Deepseek Harness) AI レビュー
-
-レビュー全体を標準入出力の ACP 接続で行います。依頼ごとに DSH を起動するため、
-別ターミナルで ACP サーバーを常駐させる必要はありません。
-
-=session/new= のモデル一覧から選択し、同じセッションへ
-=session/set_config_option= でモデルを指定します。設定の応答を確認した後、
-=session/prompt= に編集内容の全文を送ります。長い内容も切り捨てず、
-コマンドライン引数や AI が読む一時ファイルには依存しません。
-モデル側のコンテキスト上限を超える場合は DSH 側で失敗する可能性があります。
-
-DSH の =agent_message_chunk= を結果として集約し、思考やツールの実行情報は
-結果本文に混ぜません。正常終了・非空の回答・セッション終了を確認してから
-全文をコピーします。失敗やキャンセルはエラーとして表示し、成功したレビュー
-としてコピーしません。送信後の編集は実行中の依頼には反映されません。
-
-** 読み取り専用の設定
-
-起動する DSH プロセスにだけ =DSH_PERMISSION_MODE=read-only= と一時的な
-=--patch= を渡し、公式プロファイルの次の設定を固定します。
-
-- =sandbox-policy= : =mode: read-only=
-- =approval= : =policy: never=（権限昇格を自動拒否）
-- =permission= : =read-only= を唯一のプリセット・初期値に設定
-
-ACP の権限要求もすべて拒否し、クライアント側のファイル書き込み・端末操作は
-提供しません。永続的な DSH 設定ファイルは編集せず、一時パッチは完了・失敗・
-キャンセル時に削除します。
-
-前提は、公式の =acp= プロファイルと sandbox を適用する標準のツール構成です。
-ACP 自体には sandbox 状態を照会する機能がないため、任意の独自プラグインや
-sandbox を外した構成まで読み取り専用を保証するものではありません。
-DSH のセッション履歴など、DSH 自身の保存処理は行われます。
-
-仕様の参照先:
-- [[https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/README.md][公式 ACP の通信仕様]]
-- [[https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/base/cordis.patch.yml][公式プロファイルの sandbox・権限設定]]
-
-** 前提条件とモデル選択
-
-- =dsh= が Emacs の PATH にあること、または =crit-magit-dsh-command= に実行ファイルを指定すること
-- DSH の =acp= プロファイルと認証情報が設定済みであること
-- 標準 ACP v1、 =session/set_config_option= 、=session/close= と上記の設定項目に対応する DSH であること
-
-=M-x crit-magit-set-dsh-model= でもモデル一覧を取得して選択できます。
-直前の provider/model は、既定で =~/.emacs.d/crit-magit-dsh-model.json= に保存され、
-次回の選択時に初期値として提示されます。レビュー時には毎回一覧を取得します。
-接続とモデル設定・終了処理には既定30秒のタイムアウトがあります
-（ =crit-magit-dsh-discovery-timeout= ）。レビュー本体は =C-c C-k= で中止できます。
-
-* コメントと再レビュー
-
-** セッション ID
-
-コメントはリポジトリ root の =.critmagit/<session-id>.md= に保存されます。
-=session-id= の部分がセッション ID で、レビューコメントのまとまりを識別する
-自由な名前です（例: =review-login=）。ファイル名として安全な単一の要素で
-あれば何でも構いません。
-
-=crit-magit-session-id= が未設定のまま =C-c c= などのコメント操作をすると、
-=minibuffer= で =crit-magit session ID:= と聞かれます。これは追記先の
-ファイル名を確定するためです。そのまま =RET= を押すと、タイムスタンプに
-基づくランダム ID（例: =session-20260906-143000= ）を初期値として新規
-セッションを開始します。入力した値はその Emacs セッションの間記憶され、
-以後は聞かれません。
-
-聞かれたくない場合は、先に =M-x crit-magit-set-session= で設定するか、init
-ファイルで固定値を設定してください。
-
-#+begin_src emacs-lisp
-(setq crit-magit-session-id "review-login")
-#+end_src
-
-ランダム ID の形式は =crit-magit-default-session-id= で、変更する場合は
-=crit-magit-session-id-function= に文字列を返す関数を設定してください。
-
-** コメントの保存と再レビュー
-
-初回作成時に =.gitignore= へ =.critmagit/= を追加します。
-
-- =M-x crit-magit-comment= — diff の現在行または region にコメント（蓄積のみ）
-- =M-x crit-magit-comment-file= — diff の現在ファイル全体にコメント（蓄積のみ）
-- =M-x crit-magit-send-session= — 蓄積した未解決コメントを確定して DSH へまとめて送る（=C-c C-s=）
-- =M-x crit-magit-review-session= — 確認なしで保存済み未解決コメントを DSH に送る
-- =M-x crit-magit-open-session= — 現在のセッションファイルを開く
-- =M-x crit-magit-copy-session-file= — AI へ渡す指示文を kill-ring にコピー
-- =M-x crit-magit-set-session= — 現在のセッション ID を設定・変更する
-
-既定では、コメントを =C-c c= や =C-c f= で保存しても DSH には何も送られず、
-セッションファイルに蓄積していくだけです。複数のコメントを書き終えてから
-=C-c C-s=（ =M-x crit-magit-send-session= ）で確定すると、未解決コメントを
-まとめて DSH へレビュー依頼できます。コメント保存直後に即送信したい場合は
-=(setq crit-magit-review-after-comment t)= を設定してください。
-
-DSH への依頼はすべてレビュー専用です。プロンプトには「ファイルを変更・作成・
-削除しない」「commit・push しない」と明示的に指示され、DSH は各コメント ID
-ごとに、判定・根拠・別の AI エージェントが適用できる具体的な修正案を書いた
-REVIEW コメントを出力します。実際のソース修正は DSH の出力を確認した上で、
-自分または別の AI エージェントに適用させてください。
-
-DSH の実行中に追加したコメントも保存され、後で =C-c C-s= から再送できます。
-実行中の依頼へ自動追加はしません。
-
-行範囲は同じ hunk 内で指定します。追加側と削除側を混在させた範囲は、
-一部だけを黙って送らずエラーにします。両側への指摘はファイルコメントを使ってください。
-コメント保存は読み取りから置換までロックします。異常終了で
-=.critmagit/<session-id>.md.lock/= が残った場合は、他の書き込みが動いていない
-ことを確認してから、その空ディレクトリを削除してください。
-
-** 進行状況の表示
-
-進捗と経過時間は画面下部のエコー領域とモードラインへ表示します。
-モデル選択などのミニバッファ入力中は進捗メッセージで入力を妨げません。
-診断ログは =*crit-magit-progress*= に記録しますが、自動的には開きません。
-結果は =*crit-magit-review*= に表示し、コピー結果をバッファ上部で通知します。
-
-* 検証
-
-#+begin_src sh
-emacs -Q --batch -L . -l crit-magit.el -l crit-magit-test.el \
-  -l crit-magit-regression-test.el -f ert-run-tests-batch-and-exit
-#+end_src
-
-実際の Magit を使うテストは、Magit が load-path にある場合に実行されます。
-それ以外の ACP テストはローカルの模擬プロセスを使い、外部モデルには送信しません。
+GNU General Public License version 3 or later（GPL-3.0-or-later）です。
+詳細は [[file:LICENSE][LICENSE]] を参照してください。
