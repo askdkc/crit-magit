@@ -170,6 +170,7 @@
       (let* ((crit-magit-dsh-command crit-magit-test--fake-dsh)
              (crit-magit--dsh-process nil)
              (crit-magit-dsh-discovery-timeout (if (equal scenario "hang") .15 3))
+             (crit-magit-dsh-cancel-grace-seconds .1)
              (crit-magit-dsh-inline-size-limit 10)
              (process-environment (cons (concat "CRIT_MAGIT_TEST_SCENARIO=" scenario)
                                         process-environment))
@@ -207,6 +208,98 @@
               (should (eq (car result) 'error))
               (should (= count 1)))
           (when (crit-magit--dsh-running-p) (delete-process crit-magit--dsh-process)))))))
+
+(ert-deftest crit-magit-background-cancel-and-force-timeout ()
+  "Keep editing while hung; cancel once, retain input, and clean up only this request."
+  (dolist (scenario '("cancel-ack" "cancel-ignore"))
+    (let ((crit-magit-dsh-command crit-magit-test--fake-dsh)
+          (crit-magit-dsh-cancel-grace-seconds .15)
+          (crit-magit-dsh-long-running-seconds .1)
+          (crit-magit--dsh-process nil)
+          (process-environment (cons (concat "CRIT_MAGIT_TEST_SCENARIO=" scenario)
+                                     process-environment))
+          (count 0) process state result
+          (unrelated (make-process :name "crit-magit-unrelated-test"
+                                   :command '("/bin/cat") :connection-type 'pipe
+                                   :buffer nil :noquery t)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'crit-magit--dsh-choose-model)
+                     (lambda (_) '("test-provider" . "test-model")))
+                    ((symbol-function 'crit-magit--show-review)
+                     (lambda (outcome) (setq result outcome count (1+ count)))))
+            (setq process (crit-magit--request-review "original request 日本語" default-directory)
+                  state (process-get process 'crit-magit-acp-state))
+            (crit-magit-test--wait (lambda () (eq crit-magit--dsh-stage 'long-running)))
+            (should-not result)
+            (should (process-live-p process))
+            (with-temp-buffer
+              (insert "Editing continues")
+              (should (equal (buffer-string) "Editing continues"))
+              ;; Cancellation is usable outside the original draft.
+              (crit-magit-cancel-review)
+              (let ((timer (plist-get state :timer)))
+                (crit-magit-cancel-review)
+                (should (eq timer (plist-get state :timer)))))
+            (crit-magit-test--wait (lambda () result))
+            (should (= count 1))
+            (should (eq (car result) 'error))
+            (should (string-match-p "original request 日本語" (cdr result)))
+            (should (string-match-p "partial review" (cdr result)))
+            (should (string-match-p
+                     (if (equal scenario "cancel-ack")
+                         "cancellation acknowledged" "cancellation timed out")
+                     (cdr result)))
+            (should-not (process-live-p process))
+            (should-not (file-exists-p (plist-get state :patch)))
+            (should-not (buffer-live-p (plist-get state :stderr-buffer)))
+            (should-not crit-magit--progress-timer)
+            (should (process-live-p unrelated))
+            ;; A stale timer must not change the status of a subsequent review.
+            (let ((crit-magit--dsh-stage 'review))
+              (crit-magit--acp-long-running process state)
+              (should (eq crit-magit--dsh-stage 'review)))
+            (crit-magit--acp-failure process state (lambda (_) (cl-incf count)) "late")
+            (accept-process-output nil .02)
+            (should (= count 1)))
+        (when (and process (process-live-p process)) (delete-process process))
+        (when (process-live-p unrelated) (delete-process unrelated))))))
+
+(ert-deftest crit-magit-background-result-preserves-editor-and-clipboard ()
+  "Real asynchronous completion must not select a buffer or copy output."
+  (let ((crit-magit-dsh-command crit-magit-test--fake-dsh)
+        (crit-magit-dsh-review-buffer-name " *crit-magit-background-result*")
+        (crit-magit--dsh-process nil)
+        (process-environment (cons "CRIT_MAGIT_TEST_SCENARIO=normal" process-environment))
+        (kill-ring '("user clipboard")) process)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'crit-magit--dsh-choose-model)
+                     (lambda (_) '("test-provider" . "test-model")))
+                    ((symbol-function 'crit-magit--copy-review)
+                     (lambda (_) (ert-fail "Background completion copied output"))))
+            (let ((window (selected-window)) (buffer (window-buffer)))
+              (setq process (crit-magit--request-review "background" default-directory))
+              (crit-magit-test--wait
+               (lambda () (get-buffer crit-magit-dsh-review-buffer-name)))
+              (should (eq window (selected-window)))
+              (should (eq buffer (window-buffer)))
+              (should (equal kill-ring '("user clipboard")))
+              (with-current-buffer crit-magit-dsh-review-buffer-name
+                (should (string-match-p "background" (buffer-string)))))))
+      (when (and process (process-live-p process)) (delete-process process))
+      (when-let ((buffer (get-buffer crit-magit-dsh-review-buffer-name)))
+        (kill-buffer buffer)))))
+
+(ert-deftest crit-magit-background-model-selection-defers-to-minibuffer ()
+  "Discovery must not enter a nested minibuffer over another command."
+  (let ((state (list :finished nil :selection-timer nil)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'active-minibuffer-window) (lambda () t))
+                  ((symbol-function 'crit-magit--dsh-choose-model)
+                   (lambda (_) (ert-fail "Nested model selection"))))
+          (crit-magit--acp-review-select nil state #'ignore)
+          (should (timerp (plist-get state :selection-timer))))
+      (cancel-timer (plist-get state :selection-timer)))))
 
 (ert-deftest crit-magit-regression-session-writer-lock-and-path ()
   (crit-magit-test--with-repo

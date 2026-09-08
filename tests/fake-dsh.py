@@ -42,6 +42,10 @@ if args[args.index('--profile') + 1] == 'acp':
             assert os.environ['DSH_PERMISSION_MODE'] == 'read-only'
             if scenario == 'review-hang':
                 time.sleep(30)
+            if scenario in ('cancel-ack', 'cancel-ignore'):
+                pending_prompt_id = request['id']
+                update('agent_message_chunk', content={'type': 'text', 'text': 'partial review'})
+                continue
             if scenario == 'review-error':
                 print('fixture review failure', file=sys.stderr, flush=True)
                 sys.exit(7)
@@ -59,6 +63,20 @@ if args[args.index('--profile') + 1] == 'acp':
                 update('agent_message_chunk', content={'type': 'text', 'text': answer[:11]})
                 update('agent_message_chunk', content={'type': 'text', 'text': answer[11:]})
             result = {'stopReason': 'cancelled' if scenario == 'cancelled-answer' else 'end_turn'}
+        elif method == 'session/cancel':
+            assert 'id' not in request, 'Cancellation must be a notification'
+            assert request['params']['sessionId'] == 'test'
+            if scenario == 'cancel-ignore':
+                continue
+            # Permission requests and updates can still arrive during cancellation.
+            print(json.dumps({'jsonrpc': '2.0', 'id': 91, 'method': 'session/request_permission',
+                              'params': {'sessionId': 'test', 'options': []}}), flush=True)
+            permission = json.loads(sys.stdin.readline())
+            assert permission['result']['outcome']['outcome'] == 'cancelled'
+            update('agent_message_chunk', content={'type': 'text', 'text': ' cancellation acknowledged'})
+            print(json.dumps({'jsonrpc': '2.0', 'id': pending_prompt_id,
+                              'result': {'stopReason': 'cancelled'}}), flush=True)
+            continue
         elif method == 'session/close':
             if scenario == 'no-close':
                 print(json.dumps({'jsonrpc': '2.0', 'id': request['id'],

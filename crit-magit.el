@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 askdkc
 
-;; Version: 0.1.8
+;; Version: 0.1.9
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, vc
 
@@ -26,7 +26,8 @@
 ;; crit-magit adds a local AI review path to Magit diff buffers.
 ;; `crit-magit' opens a detached editable diff draft from Magit status or diff.
 ;; After editing, `crit-magit-submit' offers read-only DSH ACP review or
-;; Markdown export.  Both display the result and copy it for another AI tool.
+;; Markdown export.  ACP reviews run in the background; results can be opened
+;; and copied explicitly.  Markdown export displays and copies immediately.
 ;;
 ;; From a Magit diff buffer you can attach a review comment to the
 ;; current line, an active region, or a whole file.  Each comment is
@@ -38,8 +39,8 @@
 ;; session with `crit-magit-send-session' (C-c C-s), which sends all
 ;; unresolved comments to DSH.  The configured DSH command reads that
 ;; file, produces review-only output (no source changes), and the
-;; result is shown in the review buffer while progress appears in the echo
-;; area and is logged in `crit-magit-progress-buffer-name'.  The session directory is
+;; result is stored in the review buffer while progress appears in the mode
+;; line and is logged in `crit-magit-progress-buffer-name'.  The session directory is
 ;; added to the repository `.gitignore' once so that transient review
 ;; state never enters Git history.
 ;;
@@ -211,6 +212,20 @@ you confirm them with \\[crit-magit-send-session] or
   :type 'number
   :group 'crit-magit)
 
+(defcustom crit-magit-dsh-long-running-seconds 600
+  "Seconds of review processing before showing a nonblocking stop reminder.
+This does not automatically cancel a review."
+  :type 'natnum
+  :group 'crit-magit)
+
+(defcustom crit-magit-dsh-cancel-grace-seconds 5
+  "Seconds to allow ACP cancellation before terminating its process."
+  :type 'natnum
+  :group 'crit-magit)
+
+(defvar crit-magit--background-result nil
+  "Non-nil while storing a result without changing windows or clipboard.")
+
 (defun crit-magit--section-slot (section slot)
   "Read SLOT from a Magit SECTION without requiring Magit at compile time."
   (eieio-oref section slot))
@@ -229,18 +244,11 @@ you confirm them with \\[crit-magit-send-session] or
   "Timer refreshing the mode-line elapsed seconds while DSH runs.")
 
 (defvar crit-magit--progress-status ""
-  "Latest short status shown in the echo area during a review.")
+  "Latest short status used by the mode-line help and progress log.")
 
 (defun crit-magit--progress-refresh ()
-  "Refresh progress without interrupting minibuffer input."
-  (force-mode-line-update t)
-  (when (and (crit-magit--dsh-running-p)
-             crit-magit--dsh-start-time
-             (not (active-minibuffer-window)))
-    (let ((message-log-max nil))
-      (message "crit-magit: %s (%ds)"
-               crit-magit--progress-status
-               (round (- (float-time) (float-time crit-magit--dsh-start-time)))))))
+  "Refresh elapsed time without replacing the user's echo-area messages."
+  (force-mode-line-update t))
 
 (defun crit-magit--dsh-mode-line ()
   "Return a mode-line indicator while a DSH review is running."
@@ -249,11 +257,13 @@ you confirm them with \\[crit-magit-send-session] or
     (propertize
      (if (eq crit-magit--dsh-stage 'model-discovery)
          "crit: discovering DSH models"
-       (format "crit: DSH %s (%ds, C-c C-k to cancel)"
+       (format "crit: DSH %s (%ds, M-x crit-magit-cancel-review)"
                crit-magit--dsh-stage
                (round (float-time
                        (time-subtract (current-time)
                                       crit-magit--dsh-start-time)))))
+     'help-echo (concat crit-magit--progress-status
+                        " — M-x crit-magit-show-progress")
      'face 'mode-line-emphasis)))
 
 (defun crit-magit--progress-log (format-string &rest args)
@@ -282,7 +292,33 @@ you confirm them with \\[crit-magit-send-session] or
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert "crit-magit DSH progress\n\n"))
-      (special-mode))))
+      (special-mode)
+      (local-set-key (kbd "C-c C-k") #'crit-magit-cancel-review))))
+
+(defun crit-magit-show-progress ()
+  "Show the background review log; C-c C-k cancels the active request."
+  (interactive)
+  (unless (get-buffer crit-magit-progress-buffer-name)
+    (crit-magit--progress-open))
+  (pop-to-buffer crit-magit-progress-buffer-name))
+
+(defun crit-magit-show-review ()
+  "Show the latest stored result without changing the clipboard."
+  (interactive)
+  (unless (get-buffer crit-magit-dsh-review-buffer-name)
+    (user-error "No DSH review result yet"))
+  (pop-to-buffer crit-magit-dsh-review-buffer-name))
+
+(defun crit-magit-copy-review ()
+  "Explicitly copy the full latest review result to the clipboard and kill ring."
+  (interactive)
+  (unless (get-buffer crit-magit-dsh-review-buffer-name)
+    (user-error "No DSH review result yet"))
+  (let ((text (with-current-buffer crit-magit-dsh-review-buffer-name
+                (buffer-string))))
+    (message "%s" (if (crit-magit--copy-review text)
+                      "レビュー全文をクリップボードとkill ringにコピーしました"
+                    "レビュー全文をkill ringにコピーしました（OSクリップボードは利用不可）"))))
 
 (defun crit-magit--progress-start-timer ()
   "Start the mode-line refresh timer for elapsed seconds."
@@ -1082,6 +1118,7 @@ Only the standard select option whose id is `model' is accepted."
     (setf (plist-get state :finished) t)
     (when-let ((timer (plist-get state :timer))) (cancel-timer timer))
     (when-let ((timer (plist-get state :selection-timer))) (cancel-timer timer))
+    (when-let ((timer (plist-get state :long-timer))) (cancel-timer timer))
     (crit-magit--clear-dsh-process process)
     (set-process-query-on-exit-flag process nil)
     (when (process-live-p process)
@@ -1103,7 +1140,24 @@ Only the standard select option whose id is `model' is accepted."
          (detail (if (and stderr (not (string-empty-p stderr)))
                      (format "%s\n\n%s" message stderr)
                    message)))
-    (crit-magit--acp-finish process state callback (cons 'error detail))))
+    (let ((partial (apply #'concat (reverse (plist-get state :chunks)))))
+      (crit-magit--acp-finish
+       process state callback
+       (cons 'error (concat detail
+                            (unless (string-empty-p partial)
+                              (concat "\n\n## 未完了の部分回答\n\n" partial))))))))
+
+(defun crit-magit--acp-long-running (process state)
+  "Mark the still-active PROCESS and STATE as long running, once."
+  (when (and (eq process crit-magit--dsh-process)
+             (process-live-p process)
+             (not (plist-get state :finished))
+             (eq (plist-get state :phase) 'prompt))
+    (setq crit-magit--dsh-stage 'long-running)
+    (crit-magit--progress-log
+     "レビューが長時間継続中。停止: M-x crit-magit-cancel-review（進捗バッファでは C-c C-k）")
+    (unless (active-minibuffer-window)
+      (message "crit-magit: レビューが長時間継続中。停止: M-x crit-magit-cancel-review"))))
 
 (defun crit-magit--acp-handle-message (process state callback message)
   "Handle one parsed ACP MESSAGE during model discovery."
@@ -1211,36 +1265,40 @@ Only the standard select option whose id is `model' is accepted."
 (defun crit-magit--acp-review-select (process state callback)
   "Choose a model outside the PROCESS filter for STATE and CALLBACK."
   (unless (plist-get state :finished)
-    (condition-case err
-        (let* ((selection (crit-magit--dsh-choose-model (plist-get state :options)))
-               (value nil))
-          ;; Preserve the server's opaque spelling of the chosen value.
-          (dolist (option (plist-get state :options))
-            (when (equal (crit-magit--json-object-value option "id") "model")
-              (dolist (entry (crit-magit--json-object-value option "options"))
-                (dolist (item (if (crit-magit--json-object-value entry "group")
-                                  (crit-magit--json-object-value entry "options")
-				(list entry)))
-                  (let ((candidate (crit-magit--json-object-value item "value")))
-                    (when (equal selection (crit-magit--dsh-selection-from-value candidate))
-                      (setq value candidate)))))))
-          (unless value (user-error "Selected model is not advertised by DSH"))
-          (unless (plist-get state :finished)
-            (setf (plist-get state :phase) 'set-model
-                  (plist-get state :expected-id) 3
-                  (plist-get state :selected) selection
-                  (plist-get state :timer)
-                  (run-at-time crit-magit-dsh-discovery-timeout nil
-                               #'crit-magit--acp-failure process state callback
-                               "DSH ACP model configuration timed out"))
-            (crit-magit--acp-send
-             process 3 "session/set_config_option"
-             `((sessionId . ,(plist-get state :session-id))
-               (configId . "model") (value . ,value)))))
-      ((error quit)
-       (crit-magit--acp-failure process state callback
-                                (if (eq (car err) 'quit) "Model selection canceled"
-                                  (error-message-string err)))))))
+    (if (active-minibuffer-window)
+        (setf (plist-get state :selection-timer)
+              (run-at-time .2 nil #'crit-magit--acp-review-select
+                           process state callback))
+      (condition-case err
+          (let* ((selection (crit-magit--dsh-choose-model (plist-get state :options)))
+		 (value nil))
+            ;; Preserve the server's opaque spelling of the chosen value.
+            (dolist (option (plist-get state :options))
+              (when (equal (crit-magit--json-object-value option "id") "model")
+		(dolist (entry (crit-magit--json-object-value option "options"))
+                  (dolist (item (if (crit-magit--json-object-value entry "group")
+                                    (crit-magit--json-object-value entry "options")
+				  (list entry)))
+                    (let ((candidate (crit-magit--json-object-value item "value")))
+                      (when (equal selection (crit-magit--dsh-selection-from-value candidate))
+			(setq value candidate)))))))
+            (unless value (user-error "Selected model is not advertised by DSH"))
+            (unless (plist-get state :finished)
+              (setf (plist-get state :phase) 'set-model
+                    (plist-get state :expected-id) 3
+                    (plist-get state :selected) selection
+                    (plist-get state :timer)
+                    (run-at-time crit-magit-dsh-discovery-timeout nil
+				 #'crit-magit--acp-failure process state callback
+				 "DSH ACP model configuration timed out"))
+              (crit-magit--acp-send
+               process 3 "session/set_config_option"
+               `((sessionId . ,(plist-get state :session-id))
+		 (configId . "model") (value . ,value)))))
+	((error quit)
+	 (crit-magit--acp-failure process state callback
+                                  (if (eq (car err) 'quit) "Model selection canceled"
+                                    (error-message-string err))))))))
 
 (defun crit-magit--acp-review-update (state params)
   "Collect committed answer text and show semantic progress from PARAMS in STATE."
@@ -1288,6 +1346,8 @@ Only the standard select option whose id is `model' is accepted."
           "\n")))))
      ((not (equal id (plist-get state :expected-id)))
       (crit-magit--acp-failure process state callback "Unexpected DSH ACP response ID"))
+     ((plist-get state :cancel-requested)
+      (crit-magit--acp-failure process state callback "DSH review canceled by user"))
      ((crit-magit--json-object-value message "error")
       (crit-magit--acp-failure
        process state callback
@@ -1324,6 +1384,9 @@ Only the standard select option whose id is `model' is accepted."
                (plist-get state :phase) 'prompt
                (plist-get state :expected-id) 4)
          (setq crit-magit--dsh-stage 'review)
+         (setf (plist-get state :long-timer)
+               (run-at-time crit-magit-dsh-long-running-seconds nil
+                            #'crit-magit--acp-long-running process state))
          (crit-magit--progress-log "DSHで読み取り専用レビュー中…")
          (crit-magit--acp-send
           process 4 "session/prompt"
@@ -1409,7 +1472,8 @@ Call ON-PROMPT outside the filter after sending the captured prompt."
                       :review (and prompt t) :prompt prompt :chunks nil
                       :on-prompt on-prompt
                       :selected nil :answer nil
-                      :patch nil :selection-timer nil
+                      :patch nil :selection-timer nil :long-timer nil
+                      :cancel-requested nil
                       :stderr-buffer stderr-buffer
                       :finished nil :timer nil))
          (default-directory (expand-file-name root)))
@@ -1435,6 +1499,8 @@ Call ON-PROMPT outside the filter after sending the captured prompt."
                  :sentinel (lambda (proc event)
                              (crit-magit--acp-sentinel
                               proc state callback event)))))
+          (process-put process 'crit-magit-acp-state state)
+          (process-put process 'crit-magit-acp-callback callback)
           (crit-magit--set-dsh-process process 'model-discovery)
           (setf (plist-get state :timer)
                 (run-at-time crit-magit-dsh-discovery-timeout nil
@@ -1599,11 +1665,39 @@ called with (STATUS . TEXT) when the process exits."
        (signal (car error-data) (cdr error-data))))))
 
 (defun crit-magit-cancel-review ()
-  "Cancel active ACP discovery or DSH review and release request resources."
+  "Cancel the active review asynchronously, from any buffer.
+Send ACP session/cancel, then wait at most
+`crit-magit-dsh-cancel-grace-seconds' before terminating this process.
+Calling again while cancellation is pending does not extend the deadline."
   (interactive)
   (unless (crit-magit--dsh-running-p)
     (user-error "No DSH request is running"))
-  (delete-process crit-magit--dsh-process))
+  (let* ((process crit-magit--dsh-process)
+         (state (process-get process 'crit-magit-acp-state))
+         (callback (process-get process 'crit-magit-acp-callback)))
+    (cond
+     ((null state) (delete-process process))
+     ((plist-get state :cancel-requested) nil)
+     ((not (eq (plist-get state :phase) 'prompt))
+      (crit-magit--acp-failure process state callback "DSH request canceled by user"))
+     (t
+      (setf (plist-get state :cancel-requested) t)
+      (when-let ((timer (plist-get state :long-timer))) (cancel-timer timer))
+      (setq crit-magit--dsh-stage 'canceling)
+      (crit-magit--progress-log "停止要求を送信中…")
+      (setf (plist-get state :timer)
+            (run-at-time crit-magit-dsh-cancel-grace-seconds nil
+                         #'crit-magit--acp-failure process state callback
+                         "DSH cancellation timed out; dedicated ACP process terminated"))
+      (condition-case err
+          (process-send-string
+           process
+           (concat (json-encode
+                    `((jsonrpc . "2.0") (method . "session/cancel")
+                      (params . ((sessionId . ,(plist-get state :session-id))))))
+                   "\n"))
+        (error (crit-magit--acp-failure process state callback
+                                        (error-message-string err))))))))
 
 ;;;; DSH review prompt
 
@@ -1715,15 +1809,25 @@ STATUS is `success' or `error'.  TEXT is shown in
                   (format "DSH review failed:\n\n%s" text))))
       (special-mode)
       (goto-char (point-min)))
-    (message nil)
-    (pop-to-buffer buffer)
-    (if (eq status 'success)
-        (setq-local header-line-format
-                    (if (crit-magit--copy-review text)
-                        "全文をクリップボードにコピーしました。AIツールへレビュー結果として貼り付けられます。"
-                      "全文をEmacsのkill ringへコピーしました。OSクリップボードへのコピーは利用できませんでした。"))
-      (message "crit-magit: review failed (see %s)"
-               (buffer-name buffer)))))
+    (if crit-magit--background-result
+        (progn
+          (with-current-buffer buffer
+            (setq-local header-line-format
+                        "結果を保存しました。全文コピー: M-x crit-magit-copy-review"))
+          (crit-magit--progress-log "DSH %s: M-x crit-magit-show-review で結果を表示"
+                                    (if (eq status 'success) "完了" "停止／失敗"))
+          (unless (active-minibuffer-window)
+            (message "crit-magit: DSH %s。結果: M-x crit-magit-show-review"
+                     (if (eq status 'success) "完了" "停止／失敗"))))
+      (message nil)
+      (pop-to-buffer buffer)
+      (if (eq status 'success)
+          (setq-local header-line-format
+                      (if (crit-magit--copy-review text)
+                          "全文をクリップボードにコピーしました。AIツールへレビュー結果として貼り付けられます。"
+                        "全文をEmacsのkill ringへコピーしました。OSクリップボードへのコピーは利用できませんでした。"))
+        (message "crit-magit: review failed (see %s)"
+                 (buffer-name buffer))))))
 
 (defun crit-magit--show-review-error (format-string &rest args)
   "Display a review error made from FORMAT-STRING and ARGS."
@@ -1739,17 +1843,19 @@ ON-PROMPT, when supplied, runs after the prompt is sent."
   (crit-magit--progress-open)
   (crit-magit--progress-log "DSH ACPに接続中…")
   (condition-case err
-      (if on-prompt
-          (crit-magit--start-acp-model-discovery
-           root (lambda (outcome)
-                  (crit-magit--show-review
-                   (if (eq (car outcome) 'error)
-                       (cons 'error (concat (cdr outcome)
-                                            "\n\n## 送信したレビュー依頼（再利用用）\n\n" prompt))
-                     outcome)))
-           prompt on-prompt)
-        (crit-magit--start-acp-model-discovery root #'crit-magit--show-review prompt))
-    (error (crit-magit--show-review-error "%s" (error-message-string err)) nil)))
+      (crit-magit--start-acp-model-discovery
+       root (apply-partially #'crit-magit--review-complete prompt)
+       prompt on-prompt)
+    (error (crit-magit--review-complete prompt (cons 'error (error-message-string err))) nil)))
+
+(defun crit-magit--review-complete (prompt outcome)
+  "Store OUTCOME quietly, retaining PROMPT after failure or cancellation."
+  (let ((crit-magit--background-result t))
+    (crit-magit--show-review
+     (if (eq (car outcome) 'error)
+         (cons 'error (concat (cdr outcome)
+                              "\n\n## 送信したレビュー依頼（再利用用）\n\n" prompt))
+       outcome))))
 
 (defun crit-magit--review-session-file (root session-id session-file)
   "Start a DSH re-review for SESSION-FILE under ROOT.

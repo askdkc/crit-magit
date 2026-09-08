@@ -545,12 +545,14 @@
   "Every review uses ACP with the full prompt, including long input."
   (let ((crit-magit--dsh-process nil) captured)
     (cl-letf (((symbol-function 'crit-magit--start-acp-model-discovery)
-               (lambda (root callback &optional prompt)
+               (lambda (root callback &optional prompt _on-prompt)
                  (setq captured (list root callback prompt))))
               ((symbol-function 'crit-magit--start-dsh)
                (lambda (&rest _) (ert-fail "Must not start headless"))))
       (crit-magit--request-review "review prompt" "/tmp/repo")
-      (should (equal captured '("/tmp/repo" crit-magit--show-review "review prompt"))))))
+      (should (equal (car captured) "/tmp/repo"))
+      (should (functionp (cadr captured)))
+      (should (equal (caddr captured) "review prompt")))))
 
 (ert-deftest crit-magit-dsh-command-show-review-success ()
   "A success outcome inserts the answer into the review buffer."

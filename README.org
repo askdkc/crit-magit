@@ -12,8 +12,35 @@ Magit status で =M-x crit-magit= を実行し、開いたバッファで操作�
 - =i= : コメントを入力
 - =C-c C-c= : DSH レビューまたは Markdown 出力
 
-出力結果は =*crit-magit-review*= に表示され、クリップボードと kill ring に
-コピーされます。未追跡ファイルは対象に含まれません。
+Markdown 出力は =*crit-magit-review*= に表示され、クリップボードと kill ring に
+コピーされます。DSH レビューの結果はバックグラウンドで同バッファに保存されます。
+未追跡ファイルは対象に含まれません。
+
+* バックグラウンドレビューと停止
+
+DSH レビューはモデル選択後、Emacs で編集を続けながら実行できます。
+進捗はモードラインに表示され、完了時も画面やクリップボードを変更しません。
+Emacs の終了後まで処理を継続する機能ではありません。同時実行は1件です。
+
+- =M-x crit-magit-show-progress= : 進捗ログを表示
+- =M-x crit-magit-show-review= : 完了結果、エラー、停止時の部分回答を表示
+- =M-x crit-magit-copy-review= : 結果全文を明示的にコピー
+- =M-x crit-magit-cancel-review= : どのバッファからでも停止
+- 編集用ドラフト／進捗バッファの =C-c C-k= : 同じ停止操作
+
+レビュー開始から10分経過すると、モードラインと進捗ログで長時間実行と停止方法を
+案内します。自動では停止しません。停止時は ACP の =session/cancel= 通知を送り、
+最大5秒待って応答がなければレビュー専用プロセスを終了します。
+停止ボタンの連打で待ち時間が延びることはありません。
+元のレビュー依頼と受信済みの部分回答は結果バッファに残します。
+この保存先は Emacs のバッファであり、ディスクへの永続保存ではありません。
+強制終了時、DSH が別プロセスとして切り離した処理や外部サービス側の処理の停止までは
+保証しません。別途起動した =dsh web= は停止対象に含めません。
+
+#+begin_src emacs-lisp
+(setq crit-magit-dsh-long-running-seconds 600
+      crit-magit-dsh-cancel-grace-seconds 5)
+#+end_src
 
 * インストール
 
